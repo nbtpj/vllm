@@ -6,10 +6,10 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.generate.choice_scoring.serving import (
-    RankRequest,
-    RankResponse,
-    ScoreChoicesRequest,
-    ScoreChoicesResponse,
+    BatchRankRequest,
+    BatchRankResponse,
+    BatchScoreRequest,
+    BatchScoreResponse,
     ServingChoiceScoring,
 )
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
@@ -32,38 +32,38 @@ def _handler(request: Request) -> ServingChoiceScoring | None:
 
 
 @router.post(
-    "/score_choices",
+    "/batch_score",
     dependencies=[Depends(validate_json_request)],
     responses=_RESPONSES,
 )
 @with_cancellation
 @load_aware_call
-async def create_score_choices(request: ScoreChoicesRequest, raw_request: Request):
+async def create_batch_score(request: BatchScoreRequest, raw_request: Request):
     handler = _handler(raw_request)
     if handler is None:
-        raise NotImplementedError("The model does not support the Score Choices API")
-    result = await handler.create_score_choices(request, raw_request)
+        raise NotImplementedError("The model does not support the batch_score API")
+    result = await handler.create_batch_score(request, raw_request)
     if isinstance(result, ErrorResponse):
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
-    assert isinstance(result, ScoreChoicesResponse)
+    assert isinstance(result, BatchScoreResponse)
     return JSONResponse(content=result.model_dump())
 
 
 @router.post(
-    "/rank",
+    "/batch_rank",
     dependencies=[Depends(validate_json_request)],
     responses=_RESPONSES,
 )
 @with_cancellation
 @load_aware_call
-async def create_rank(request: RankRequest, raw_request: Request):
+async def create_batch_rank(request: BatchRankRequest, raw_request: Request):
     handler = _handler(raw_request)
     if handler is None:
-        raise NotImplementedError("The model does not support the Rank API")
-    result = await handler.create_rank(request, raw_request)
+        raise NotImplementedError("The model does not support the batch_rank API")
+    result = await handler.create_batch_rank(request, raw_request)
     if isinstance(result, ErrorResponse):
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
-    assert isinstance(result, RankResponse)
+    assert isinstance(result, BatchRankResponse)
     return JSONResponse(content=result.model_dump())
 
 

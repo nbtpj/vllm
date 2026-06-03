@@ -66,7 +66,7 @@ RawChoiceField = list[str] | list[list[int]] | list[dict]
 # ============================================================================
 # Protocol
 # ============================================================================
-class ScoreChoicesRequest(OpenAIBaseModel):
+class BatchScoreRequest(OpenAIBaseModel):
     model: str | None = None
     prompt: str | list[int] = Field(
         ..., description="Prompt text or pre-tokenized prompt token ids."
@@ -94,7 +94,7 @@ class ScoreChoicesRequest(OpenAIBaseModel):
     request_id: str = Field(default_factory=random_uuid)
 
 
-class RankRequest(OpenAIBaseModel):
+class BatchRankRequest(OpenAIBaseModel):
     model: str | None = None
     prompt: str | list[int] = Field(...)
     candidates: RawChoiceField = Field(
@@ -120,7 +120,7 @@ class ChoiceScoreResult(OpenAIBaseModel):
     text: str | None = None
 
 
-class ScoreChoicesResponse(OpenAIBaseModel):
+class BatchScoreResponse(OpenAIBaseModel):
     id: str = ""
     object: str = "list"
     created: int = Field(default_factory=lambda: int(time.time()))
@@ -142,7 +142,7 @@ class RankStepResult(OpenAIBaseModel):
     text: str | None = None
 
 
-class RankResponse(OpenAIBaseModel):
+class BatchRankResponse(OpenAIBaseModel):
     id: str = ""
     object: str = "list"
     created: int = Field(default_factory=lambda: int(time.time()))
@@ -273,11 +273,11 @@ class ServingChoiceScoring(OpenAIServing):
         }
         return ctx, None
 
-    async def create_score_choices(
+    async def create_batch_score(
         self,
-        request: ScoreChoicesRequest,
+        request: BatchScoreRequest,
         raw_request: Request | None = None,
-    ) -> ScoreChoicesResponse | ErrorResponse:
+    ) -> BatchScoreResponse | ErrorResponse:
         ctx, error = await self._prepare(request, raw_request, request.choices)
         if error is not None:
             return error
@@ -289,7 +289,7 @@ class ServingChoiceScoring(OpenAIServing):
             return self.create_error_response(str(e))
 
         base_id = self._base_request_id(raw_request, default=request.request_id)
-        request_id = f"score-choices-{base_id}"
+        request_id = f"batch-score-{base_id}"
         token_counter = [0]
         score_fn = self._make_async_score_batch_fn(
             request_id,
@@ -313,11 +313,11 @@ class ServingChoiceScoring(OpenAIServing):
             outputs[0], request, ctx["lora_request"], request_id, token_counter[0]
         )
 
-    async def create_rank(
+    async def create_batch_rank(
         self,
-        request: RankRequest,
+        request: BatchRankRequest,
         raw_request: Request | None = None,
-    ) -> RankResponse | ErrorResponse:
+    ) -> BatchRankResponse | ErrorResponse:
         ctx, error = await self._prepare(request, raw_request, request.candidates)
         if error is not None:
             return error
@@ -335,7 +335,7 @@ class ServingChoiceScoring(OpenAIServing):
             return self.create_error_response(str(e))
 
         base_id = self._base_request_id(raw_request, default=request.request_id)
-        request_id = f"rank-{base_id}"
+        request_id = f"batch-rank-{base_id}"
         token_counter = [0]
         score_fn = self._make_async_score_batch_fn(
             request_id,
@@ -366,11 +366,11 @@ class ServingChoiceScoring(OpenAIServing):
     def _build_score_response(
         self,
         out: ScoreChoicesOutput,
-        request: ScoreChoicesRequest,
+        request: BatchScoreRequest,
         lora_request,
         request_id: str,
         total_tokens: int,
-    ) -> ScoreChoicesResponse:
+    ) -> BatchScoreResponse:
         choices = [
             ChoiceScoreResult(
                 index=c.index,
@@ -384,7 +384,7 @@ class ServingChoiceScoring(OpenAIServing):
             )
             for c in out.choices
         ]
-        return ScoreChoicesResponse(
+        return BatchScoreResponse(
             id=request_id,
             model=self.models.model_name(lora_request),
             prompt_token_ids=out.prompt_token_ids,
@@ -400,11 +400,11 @@ class ServingChoiceScoring(OpenAIServing):
     def _build_rank_response(
         self,
         out: RankOutput,
-        request: RankRequest,
+        request: BatchRankRequest,
         lora_request,
         request_id: str,
         total_tokens: int,
-    ) -> RankResponse:
+    ) -> BatchRankResponse:
         selected = [
             RankStepResult(
                 order=s.order,
@@ -418,7 +418,7 @@ class ServingChoiceScoring(OpenAIServing):
             )
             for s in out.selected
         ]
-        return RankResponse(
+        return BatchRankResponse(
             id=request_id,
             model=self.models.model_name(lora_request),
             prompt_token_ids=out.prompt_token_ids,

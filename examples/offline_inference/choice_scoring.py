@@ -3,7 +3,7 @@
 """Comprehensive offline examples for choice scoring, ranking and weight reload.
 
 Demonstrates:
-  * score_choices  -- per-token logprobs + sum/mean/greedy + best choice
+  * batch_score  -- per-token logprobs + sum/mean/greedy + best choice
   * multiple-choice accuracy (lm-eval "loglikelihood" style)
   * batched scoring with per-prompt choice sets of different sizes
   * text vs pre-tokenized choices (and select_by mean vs sum)
@@ -21,8 +21,8 @@ from vllm import LLM
 
 
 def demo_score_basic(llm: LLM) -> None:
-    print("\n=== score_choices: basic ===")
-    out = llm.score_choices(
+    print("\n=== batch_score: basic ===")
+    out = llm.batch_score(
         "The capital of France is",
         [" Paris", " London", " a large historic city"],
     )
@@ -37,7 +37,7 @@ def demo_score_basic(llm: LLM) -> None:
 
 def demo_multiple_choice_accuracy(llm: LLM) -> None:
     """lm-eval 'loglikelihood' style: pick the choice with the best mean logprob."""
-    print("\n=== score_choices: multiple-choice accuracy ===")
+    print("\n=== batch_score: multiple-choice accuracy ===")
     questions = [
         ("2 + 2 = ", [" 4", " 5", " 22"], 0),
         ("The sky is ", [" blue", " green", " loud"], 0),
@@ -47,7 +47,7 @@ def demo_multiple_choice_accuracy(llm: LLM) -> None:
     choices = [c for _, c, _ in questions]
     answers = [a for _, _, a in questions]
 
-    outs = llm.score_choices(prompts, choices, select_by="mean")
+    outs = llm.batch_score(prompts, choices, select_by="mean")
     correct = 0
     for (q, ch, gold), out in zip(questions, outs):
         pred = out.best_choice_index
@@ -58,19 +58,19 @@ def demo_multiple_choice_accuracy(llm: LLM) -> None:
 
 
 def demo_batch_and_token_ids(llm: LLM) -> None:
-    print("\n=== score_choices: batch + token-id choices + select_by ===")
+    print("\n=== batch_score: batch + token-id choices + select_by ===")
     tok = llm.get_tokenizer()
     prompt = "Two plus two equals"
     text_choices = [" four", " five", " a number"]
     id_choices = [tok.encode(c, add_special_tokens=False) for c in text_choices]
 
-    by_mean = llm.score_choices(prompt, text_choices, select_by="mean")
-    by_sum = llm.score_choices(prompt, id_choices, select_by="sum")  # token-id input
+    by_mean = llm.batch_score(prompt, text_choices, select_by="mean")
+    by_sum = llm.batch_score(prompt, id_choices, select_by="sum")  # token-id input
     print(f"  best by mean = {by_mean.best_choice_index}")
     print(f"  best by sum  = {by_sum.best_choice_index}  (token-id input)")
 
     # A real batch: each prompt has its own (differently sized) choice set.
-    outs = llm.score_choices(
+    outs = llm.batch_score(
         ["The opposite of hot is", "A baby dog is called a"],
         [[" cold", " warm"], [" puppy", " kitten", " calf"]],
     )
@@ -82,19 +82,19 @@ def demo_rank(llm: LLM) -> None:
     prompt = "List European capital cities:"
     cands = [" Paris", " Berlin", " Tokyo", " Madrid", " Cairo"]
 
-    ranked = llm.rank(prompt, cands, k=3)
+    ranked = llm.batch_rank(prompt, cands, k=3)
     print(f"  top-3 (truncated={ranked.truncated}):")
     for step in ranked.selected:
         print(f"    #{step.order}: {cands[step.choice_index]!r} "
               f"(mean={step.mean_logprob:.3f})")
 
     # k > pool size -> full ordering, truncated=True.
-    full = llm.rank(prompt, cands, k=99)
+    full = llm.batch_rank(prompt, cands, k=99)
     order = [cands[s.choice_index] for s in full.selected]
     print(f"  full ordering (truncated={full.truncated}): {order}")
 
     # Batched rank with a per-prompt k.
-    outs = llm.rank(
+    outs = llm.batch_rank(
         ["Rank by size:", "Rank by heat:"],
         [[" elephant", " mouse", " whale"], [" sun", " ice", " fire"]],
         k=[2, 1],

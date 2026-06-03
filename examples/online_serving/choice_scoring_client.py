@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Client examples for the /score_choices, /rank and /reload_weights endpoints.
+"""Client examples for the /batch_score, /batch_rank and /reload_weights endpoints.
 
 Start a server first (any generative model), e.g.:
     vllm serve distilbert/distilgpt2 --enforce-eager
@@ -17,10 +17,10 @@ import argparse
 import requests
 
 
-def score_choices(base_url: str) -> None:
-    print("\n=== POST /score_choices ===")
+def batch_score(base_url: str) -> None:
+    print("\n=== POST /batch_score ===")
     resp = requests.post(
-        f"{base_url}/score_choices",
+        f"{base_url}/batch_score",
         json={
             "prompt": "The capital of France is",
             "choices": [" Paris", " London", " a large historic city"],
@@ -37,9 +37,9 @@ def score_choices(base_url: str) -> None:
 
 
 def score_with_token_ids(base_url: str) -> None:
-    print("\n=== POST /score_choices (pre-tokenized choices) ===")
+    print("\n=== POST /batch_score (pre-tokenized choices) ===")
     resp = requests.post(
-        f"{base_url}/score_choices",
+        f"{base_url}/batch_score",
         json={"prompt": "Two plus two equals", "choices": [[604], [642]]},
         timeout=60,
     )
@@ -48,9 +48,9 @@ def score_with_token_ids(base_url: str) -> None:
 
 
 def rank(base_url: str) -> None:
-    print("\n=== POST /rank ===")
+    print("\n=== POST /batch_rank ===")
     resp = requests.post(
-        f"{base_url}/rank",
+        f"{base_url}/batch_rank",
         json={
             "prompt": "List European capital cities:",
             "candidates": [" Paris", " Berlin", " Tokyo", " Madrid"],
@@ -87,7 +87,7 @@ def main():
     )
     args = parser.parse_args()
 
-    score_choices(args.base_url)
+    batch_score(args.base_url)
     score_with_token_ids(args.base_url)
     rank(args.base_url)
     if args.reload:

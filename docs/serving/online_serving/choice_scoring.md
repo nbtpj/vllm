@@ -9,7 +9,7 @@ semantics.
 Both endpoints are available automatically when the server is started with a
 generative model.
 
-## `POST /score_choices`
+## `POST /batch_score`
 
 Returns the teacher-forced per-token log-probabilities of every choice, with
 `sum` / `mean` aggregates, a greedy flag, and the best choice.
@@ -20,7 +20,7 @@ lists, or `{text|token_ids}` dicts), `select_by` (`"mean"` default or `"sum"`),
 `return_tokens` (default `true`).
 
 ```bash
-curl -X POST http://localhost:8000/score_choices \
+curl -X POST http://localhost:8000/batch_score \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "The capital of France is",
@@ -32,7 +32,7 @@ curl -X POST http://localhost:8000/score_choices \
 
     ```json
     {
-      "id": "score-choices-abc123",
+      "id": "batch-score-abc123",
       "object": "list",
       "model": "Qwen/Qwen3-0.6B",
       "prompt_token_ids": [791, 6864, 315, 9822, 374],
@@ -53,7 +53,7 @@ curl -X POST http://localhost:8000/score_choices \
     }
     ```
 
-## `POST /rank`
+## `POST /batch_rank`
 
 Autoregressively selects an ordered list of `k` bundles from the candidate pool,
 re-scoring the remaining candidates against the growing context at each step.
@@ -63,7 +63,7 @@ stop), plus the same `select_by` / `num_prompt_logprobs` / `add_special_tokens`
 / `return_tokens` options.
 
 ```bash
-curl -X POST http://localhost:8000/rank \
+curl -X POST http://localhost:8000/batch_rank \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Rank these cities by relevance to France:",
@@ -76,7 +76,7 @@ curl -X POST http://localhost:8000/rank \
 
     ```json
     {
-      "id": "rank-abc123",
+      "id": "batch-rank-abc123",
       "object": "list",
       "model": "Qwen/Qwen3-0.6B",
       "prompt_token_ids": [...],

@@ -45,7 +45,7 @@ CHOICES = [" Paris", " London", " a very large and historic city"]
 # --------------------------------------------------------------------------- #
 @pytest.mark.skip_global_cleanup
 def test_score_choices_basic_consistency(llm: LLM):
-    out = llm.score_choices(PROMPT, CHOICES)
+    out = llm.batch_score(PROMPT, CHOICES)
     assert len(out.choices) == len(CHOICES)
     for ch in out.choices:
         assert len(ch.token_logprobs) == len(ch.token_ids)
@@ -61,7 +61,7 @@ def test_score_choices_basic_consistency(llm: LLM):
 
 @pytest.mark.skip_global_cleanup
 def test_score_choices_select_by_sum(llm: LLM):
-    out = llm.score_choices(PROMPT, CHOICES, select_by="sum")
+    out = llm.batch_score(PROMPT, CHOICES, select_by="sum")
     sums = [c.sum_logprob for c in out.choices]
     assert out.best_choice_index == sums.index(max(sums))
 
@@ -70,8 +70,8 @@ def test_score_choices_select_by_sum(llm: LLM):
 def test_score_choices_text_vs_token_ids_parity(llm: LLM):
     tok = llm.get_tokenizer()
     choice_ids = [tok.encode(c, add_special_tokens=False) for c in CHOICES]
-    by_text = llm.score_choices(PROMPT, CHOICES)
-    by_ids = llm.score_choices(PROMPT, choice_ids)
+    by_text = llm.batch_score(PROMPT, CHOICES)
+    by_ids = llm.batch_score(PROMPT, choice_ids)
     for a, b in zip(by_text.choices, by_ids.choices):
         assert a.token_ids == b.token_ids
         assert a.token_logprobs == pytest.approx(b.token_logprobs, abs=1e-5)
@@ -80,15 +80,15 @@ def test_score_choices_text_vs_token_ids_parity(llm: LLM):
 @pytest.mark.skip_global_cleanup
 def test_score_choices_chosen_logprob_topk_invariant(llm: LLM):
     # The actual token's logprob must not depend on how many top-k we request.
-    a = llm.score_choices(PROMPT, CHOICES, num_prompt_logprobs=0)
-    b = llm.score_choices(PROMPT, CHOICES, num_prompt_logprobs=5)
+    a = llm.batch_score(PROMPT, CHOICES, num_prompt_logprobs=0)
+    b = llm.batch_score(PROMPT, CHOICES, num_prompt_logprobs=5)
     for ca, cb in zip(a.choices, b.choices):
         assert ca.token_logprobs == pytest.approx(cb.token_logprobs, abs=1e-5)
 
 
 @pytest.mark.skip_global_cleanup
 def test_score_choices_logprobs_are_valid(llm: LLM):
-    out = llm.score_choices(PROMPT, CHOICES)
+    out = llm.batch_score(PROMPT, CHOICES)
     for ch in out.choices:
         for lp in ch.token_logprobs:
             assert lp <= 1e-4  # log-prob of a probability is <= 0
@@ -99,7 +99,7 @@ def test_score_choices_logprobs_are_valid(llm: LLM):
 def test_score_choices_batch_independent(llm: LLM):
     prompts = ["The capital of France is", "Two plus two equals"]
     choices = [[" Paris", " London"], [" four", " five", " purple"]]
-    outs = llm.score_choices(prompts, choices)
+    outs = llm.batch_score(prompts, choices)
     assert isinstance(outs, list) and len(outs) == 2
     assert len(outs[0].choices) == 2
     assert len(outs[1].choices) == 3
@@ -107,8 +107,8 @@ def test_score_choices_batch_independent(llm: LLM):
 
 @pytest.mark.skip_global_cleanup
 def test_score_choices_deterministic(llm: LLM):
-    a = llm.score_choices(PROMPT, CHOICES)
-    b = llm.score_choices(PROMPT, CHOICES)
+    a = llm.batch_score(PROMPT, CHOICES)
+    b = llm.batch_score(PROMPT, CHOICES)
     assert a.best_choice_index == b.best_choice_index
     for ca, cb in zip(a.choices, b.choices):
         assert ca.token_logprobs == pytest.approx(cb.token_logprobs, abs=1e-6)
@@ -119,7 +119,7 @@ def test_score_choices_deterministic(llm: LLM):
 # --------------------------------------------------------------------------- #
 @pytest.mark.skip_global_cleanup
 def test_rank_basic_shape(llm: LLM):
-    out = llm.rank(PROMPT, CHOICES, k=2)
+    out = llm.batch_rank(PROMPT, CHOICES, k=2)
     assert len(out.selected) == 2
     assert out.truncated is False
     assert [s.order for s in out.selected] == [0, 1]
@@ -130,7 +130,7 @@ def test_rank_basic_shape(llm: LLM):
 
 @pytest.mark.skip_global_cleanup
 def test_rank_full_ordering_is_permutation(llm: LLM):
-    out = llm.rank(PROMPT, CHOICES, k=len(CHOICES))
+    out = llm.batch_rank(PROMPT, CHOICES, k=len(CHOICES))
     picked = sorted(s.choice_index for s in out.selected)
     assert picked == list(range(len(CHOICES)))
     assert out.truncated is False
@@ -138,7 +138,7 @@ def test_rank_full_ordering_is_permutation(llm: LLM):
 
 @pytest.mark.skip_global_cleanup
 def test_rank_k_exceeds_pool_truncates(llm: LLM):
-    out = llm.rank(PROMPT, CHOICES, k=99)
+    out = llm.batch_rank(PROMPT, CHOICES, k=99)
     assert len(out.selected) == len(CHOICES)
     assert out.truncated is True
 
@@ -146,15 +146,15 @@ def test_rank_k_exceeds_pool_truncates(llm: LLM):
 @pytest.mark.skip_global_cleanup
 def test_rank_k1_matches_score_best(llm: LLM):
     # rank step 0 scores against the prompt alone -> identical to score_choices.
-    ranked = llm.rank(PROMPT, CHOICES, k=1, select_by="mean")
-    scored = llm.score_choices(PROMPT, CHOICES, select_by="mean")
+    ranked = llm.batch_rank(PROMPT, CHOICES, k=1, select_by="mean")
+    scored = llm.batch_score(PROMPT, CHOICES, select_by="mean")
     assert ranked.selected[0].choice_index == scored.best_choice_index
 
 
 @pytest.mark.skip_global_cleanup
 def test_rank_deterministic(llm: LLM):
-    a = llm.rank(PROMPT, CHOICES, k=len(CHOICES))
-    b = llm.rank(PROMPT, CHOICES, k=len(CHOICES))
+    a = llm.batch_rank(PROMPT, CHOICES, k=len(CHOICES))
+    b = llm.batch_rank(PROMPT, CHOICES, k=len(CHOICES))
     assert [s.choice_index for s in a.selected] == [
         s.choice_index for s in b.selected
     ]
@@ -162,7 +162,7 @@ def test_rank_deterministic(llm: LLM):
 
 @pytest.mark.skip_global_cleanup
 def test_rank_per_token_logprobs_recorded(llm: LLM):
-    out = llm.rank(PROMPT, CHOICES, k=2)
+    out = llm.batch_rank(PROMPT, CHOICES, k=2)
     for step in out.selected:
         assert len(step.token_logprobs) == len(step.token_ids)
         assert step.mean_logprob == pytest.approx(
@@ -174,7 +174,7 @@ def test_rank_per_token_logprobs_recorded(llm: LLM):
 def test_rank_batch_per_prompt_k(llm: LLM):
     prompts = ["The capital of France is", "Two plus two equals"]
     cands = [[" Paris", " London", " Berlin"], [" four", " five"]]
-    outs = llm.rank(prompts, cands, k=[2, 1])
+    outs = llm.batch_rank(prompts, cands, k=[2, 1])
     assert len(outs) == 2
     assert len(outs[0].selected) == 2
     assert len(outs[1].selected) == 1

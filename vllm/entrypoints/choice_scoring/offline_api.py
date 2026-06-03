@@ -5,10 +5,10 @@
 Provides :class:`ChoiceScoringOfflineMixin` with two methods mixed into
 :class:`~vllm.entrypoints.llm.LLM`:
 
-* ``score_choices(prompts, choices)`` -- teacher-forced per-token logprobs (plus
+* ``batch_score(prompts, choices)`` -- teacher-forced per-token logprobs (plus
   sum/mean/greedy and the best choice) for every choice of every prompt.
-* ``rank(prompts, candidates, k)`` -- autoregressive ordered selection of ``k``
-  bundles per prompt from a shrinking candidate pool.
+* ``batch_rank(prompts, candidates, k)`` -- autoregressive ordered selection of
+  ``k`` bundles per prompt from a shrinking candidate pool.
 
 Both build on the model-independent, unit-tested layers (:mod:`core`,
 :mod:`batching`, :mod:`reference`, :mod:`inputs`) and the existing generate
@@ -71,7 +71,7 @@ def _largest_growth(candidates: Sequence[Candidate], k: int) -> int:
 
 
 class ChoiceScoringOfflineMixin:
-    """Mixin adding ``score_choices`` and ``rank`` to ``LLM``."""
+    """Mixin adding ``batch_score`` and ``batch_rank`` to ``LLM``."""
 
     # Provided by LLM.
     get_tokenizer: Callable[[], object]
@@ -149,7 +149,7 @@ class ChoiceScoringOfflineMixin:
         ]
         return prompt_ids, cand_lists, single
 
-    def score_choices(
+    def batch_score(
         self,
         prompts: RawPrompt | Sequence[RawPrompt],
         choices: Sequence[RawChoice] | Sequence[Sequence[RawChoice]],
@@ -181,7 +181,7 @@ class ChoiceScoringOfflineMixin:
         )
         return outputs[0] if single else outputs
 
-    def rank(
+    def batch_rank(
         self,
         prompts: RawPrompt | Sequence[RawPrompt],
         candidates: Sequence[RawChoice] | Sequence[Sequence[RawChoice]],

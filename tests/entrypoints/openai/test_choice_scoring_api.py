@@ -30,7 +30,7 @@ def _post(server, path, payload):
 
 
 def test_score_choices_basic(server):
-    r = _post(server, "score_choices", {"prompt": PROMPT, "choices": CHOICES})
+    r = _post(server, "batch_score", {"prompt": PROMPT, "choices": CHOICES})
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["choices"]) == len(CHOICES)
@@ -44,7 +44,7 @@ def test_score_choices_basic(server):
 def test_score_choices_select_by_sum(server):
     r = _post(
         server,
-        "score_choices",
+        "batch_score",
         {"prompt": PROMPT, "choices": CHOICES, "select_by": "sum"},
     )
     assert r.status_code == 200, r.text
@@ -56,20 +56,20 @@ def test_score_choices_select_by_sum(server):
 def test_score_choices_text_vs_token_ids_parity(server):
     tok = get_tokenizer(MODEL_NAME)
     ids = [tok.encode(c, add_special_tokens=False) for c in CHOICES]
-    a = _post(server, "score_choices", {"prompt": PROMPT, "choices": CHOICES}).json()
-    b = _post(server, "score_choices", {"prompt": PROMPT, "choices": ids}).json()
+    a = _post(server, "batch_score", {"prompt": PROMPT, "choices": CHOICES}).json()
+    b = _post(server, "batch_score", {"prompt": PROMPT, "choices": ids}).json()
     for ca, cb in zip(a["choices"], b["choices"]):
         assert ca["token_ids"] == cb["token_ids"]
         assert ca["token_logprobs"] == pytest.approx(cb["token_logprobs"], abs=1e-4)
 
 
 def test_score_choices_empty_choices_is_error(server):
-    r = _post(server, "score_choices", {"prompt": PROMPT, "choices": []})
+    r = _post(server, "batch_score", {"prompt": PROMPT, "choices": []})
     assert r.status_code == 400
 
 
 def test_rank_basic(server):
-    r = _post(server, "rank", {"prompt": PROMPT, "candidates": CHOICES, "k": 2})
+    r = _post(server, "batch_rank", {"prompt": PROMPT, "candidates": CHOICES, "k": 2})
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["selected"]) == 2
@@ -80,7 +80,7 @@ def test_rank_basic(server):
 
 
 def test_rank_truncates_when_k_exceeds_pool(server):
-    r = _post(server, "rank", {"prompt": PROMPT, "candidates": CHOICES, "k": 99})
+    r = _post(server, "batch_rank", {"prompt": PROMPT, "candidates": CHOICES, "k": 99})
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["selected"]) == len(CHOICES)
@@ -90,17 +90,17 @@ def test_rank_truncates_when_k_exceeds_pool(server):
 def test_rank_k1_matches_score_best(server):
     rank = _post(
         server,
-        "rank",
+        "batch_rank",
         {"prompt": PROMPT, "candidates": CHOICES, "k": 1, "select_by": "mean"},
     ).json()
     score = _post(
         server,
-        "score_choices",
+        "batch_score",
         {"prompt": PROMPT, "choices": CHOICES, "select_by": "mean"},
     ).json()
     assert rank["selected"][0]["choice_index"] == score["best_choice_index"]
 
 
 def test_rank_negative_k_is_error(server):
-    r = _post(server, "rank", {"prompt": PROMPT, "candidates": CHOICES, "k": -1})
+    r = _post(server, "batch_rank", {"prompt": PROMPT, "candidates": CHOICES, "k": -1})
     assert r.status_code == 400
