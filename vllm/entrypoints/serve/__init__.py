@@ -59,3 +59,7 @@ def register_vllm_dev_api_routers(app: FastAPI):
     from .dev.sleep.api_router import attach_router as attach_sleep_router
 
     attach_sleep_router(app)
+
+    from .dev.weights.api_router import attach_router as attach_weights_router
+
+    attach_weights_router(app)

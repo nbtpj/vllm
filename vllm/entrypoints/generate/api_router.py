@@ -45,6 +45,10 @@ def register_generate_api_routers(app: FastAPI):
 
     register_generative_scoring_api_router(app)
 
+    from .choice_scoring.api_router import register_choice_scoring_api_router
+
+    register_choice_scoring_api_router(app)
+
 
 async def init_generate_state(
     engine_client: "EngineClient",
@@ -196,4 +200,16 @@ async def init_generate_state(
         engine_client,
         state.openai_serving_models,
         request_logger=request_logger,
+    )
+
+    from .choice_scoring.serving import ServingChoiceScoring
+
+    state.serving_choice_scoring = (
+        ServingChoiceScoring(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+        )
+        if "generate" in supported_tasks
+        else None
     )

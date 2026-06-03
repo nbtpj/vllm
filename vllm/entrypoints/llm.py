@@ -38,6 +38,7 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     load_chat_template,
 )
+from vllm.entrypoints.choice_scoring.offline_api import ChoiceScoringOfflineMixin
 from vllm.entrypoints.generate.beam_search.offline import BeamSearchOfflineMixin
 from vllm.entrypoints.pooling.offline import PoolingOfflineMixin
 from vllm.entrypoints.utils import log_non_default_args
@@ -63,7 +64,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
+class LLM(
+    BeamSearchOfflineMixin,
+    PoolingOfflineMixin,
+    ChoiceScoringOfflineMixin,
+    OfflineInferenceMixin,
+):
     """An LLM for generating texts from given prompts and sampling parameters.
 
     This class includes a tokenizer, a language model (possibly distributed
@@ -802,6 +808,72 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         return self.llm_engine.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def reload_weights(
+        self,
+        weights_path: str | None = None,
+        *,
+        state_dict: Any | None = None,
+        is_checkpoint_format: bool = True,
+        reset_running_requests: bool = True,
+    ) -> None:
+        """Hot-reload model weights in place without restarting the engine.
+
+        Loads weights for the **same architecture** on every worker via
+        ``collective_rpc("reload_weights")``, from one of three sources:
+
+        * ``state_dict`` -- in-memory weights, with **no disk round-trip and no
+          extra copy of the weight data**. Accepts a live ``nn.Module`` (e.g. a
+          HuggingFace model -- its ``state_dict()`` is called for you), a
+          ``{name: tensor}`` mapping, or any iterable of ``(name, tensor)``
+          pairs. Passing ``hf_model.state_dict()`` hands vLLM *references* to
+          the live tensors; vLLM then writes them into its own pre-allocated,
+          repacked (fused/sharded) parameter buffers -- that final write is
+          intrinsic and the only unavoidable copy. Each worker's
+          ``load_weights`` selects its own tensor-parallel shard, so pass the
+          full (unsharded) checkpoint-format state dict. **Caveat:** references
+          are passed by-reference only with an **in-process** engine (TP=1, no
+          multiprocessing); with MP/TP workers the tensors are serialized to
+          each worker. For distributed GPU-to-GPU weight sync prefer the NCCL
+          weight-transfer path (``--weight-transfer-backend nccl`` + the
+          ``/v1/admin/rlhf/*`` endpoints).
+        * ``weights_path`` -- a local checkpoint dir or Hugging Face id.
+        * neither -- reload from the engine's original model path.
+
+        The prefix cache is invalidated afterward so no KV computed with the
+        previous weights is reused. Intended for the train-then-serve / RLHF
+        loop where architecture, tokenizer and parallelism are unchanged.
+
+        Args:
+            weights_path: New checkpoint dir / HF id, or ``None``.
+            state_dict: In-memory weights mapping/iterable, mutually exclusive
+                with ``weights_path``.
+            is_checkpoint_format: Set ``False`` only if the provided weights are
+                already in (sharded) kernel format rather than checkpoint format.
+            reset_running_requests: Also invalidate KV for in-flight requests
+                (recommended after a weight change).
+        """
+        if weights_path is not None and state_dict is not None:
+            raise ValueError("pass at most one of weights_path / state_dict")
+
+        if state_dict is not None:
+            src = state_dict
+            # Accept a live module (e.g. a HF model) directly: pull references
+            # to its parameters via state_dict() -- this copies no weight data.
+            if hasattr(src, "state_dict") and callable(src.state_dict):
+                src = src.state_dict()
+            items = src.items() if hasattr(src, "items") else src
+            kwargs: dict[str, Any] = {
+                "weights_iterator": list(items),
+                "is_checkpoint_format": is_checkpoint_format,
+            }
+        elif weights_path is not None:
+            kwargs = {"weights_path": weights_path}
+        else:
+            kwargs = {}
+
+        self.collective_rpc("reload_weights", kwargs=kwargs)
+        self.reset_prefix_cache(reset_running_requests=reset_running_requests)
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """
