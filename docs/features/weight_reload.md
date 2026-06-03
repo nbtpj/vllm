@@ -8,6 +8,17 @@ weights and keep serving.
 After reloading, the [prefix cache](automatic_prefix_caching.md) is invalidated
 so no KV state computed with the previous weights is reused.
 
+!!! note "`reload_weights` vs. weight transfer"
+    This is a **direct, one-shot load** from a checkpoint path / HF id (or an
+    in-RAM state dict) that needs **no communicator setup** — use it for "load
+    this checkpoint now" flows (eval loops, periodic refresh, a quick swap).
+    For **streaming weight sync from a live trainer** every step, use vLLM's
+    [weight transfer](../training/weight_transfer/README.md) instead (IPC
+    zero-copy when colocated, or NCCL GPU-to-GPU), which stands up a
+    communicator and pushes `named_parameters()` incrementally. They are
+    complementary: weight transfer can't do a bare path-load, and
+    `reload_weights` isn't meant for per-step streaming.
+
 ## Offline: `LLM.reload_weights`
 
 ```python
