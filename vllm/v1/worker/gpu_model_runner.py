@@ -5363,13 +5363,22 @@ class GPUModelRunner(
         # load weights from disk if none are provided
         if weights_iterator is None:
             model_loader = get_model_loader(self.load_config)
-            if not hasattr(model_loader, "get_all_weights"):
-                raise NotImplementedError(
-                    f"Model reloading with `{self.load_config.load_format}` format"
-                )
-
             if weights_path is not None:
                 self.model_config.model = weights_path
+
+            if not hasattr(model_loader, "get_all_weights"):
+                # Loaders without a get_all_weights generator (e.g.
+                # bitsandbytes, gguf, gptq, awq) implement the base in-place
+                # load_weights, which applies their own (de)quantization /
+                # repacking. Delegate to it -- this is the only reload path
+                # those formats support.
+                logger.info_once(
+                    "Reloading weights inplace via the %s loader...",
+                    self.load_config.load_format,
+                )
+                model_loader.load_weights(model, self.model_config)
+                return
+
             weights_iterator = model_loader.get_all_weights(self.model_config, model)
             weights_iterator = cast(
                 Iterable[tuple[str, torch.Tensor]], weights_iterator
