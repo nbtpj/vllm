@@ -822,21 +822,21 @@ class LLM(
         Loads weights for the **same architecture** on every worker via
         ``collective_rpc("reload_weights")``, from one of three sources:
 
-        * ``state_dict`` -- in-memory weights, with **no disk round-trip and no
-          extra copy of the weight data**. Accepts a live ``nn.Module`` (e.g. a
-          HuggingFace model -- its ``state_dict()`` is called for you), a
-          ``{name: tensor}`` mapping, or any iterable of ``(name, tensor)``
-          pairs. Passing ``hf_model.state_dict()`` hands vLLM *references* to
-          the live tensors; vLLM then writes them into its own pre-allocated,
-          repacked (fused/sharded) parameter buffers -- that final write is
-          intrinsic and the only unavoidable copy. Each worker's
-          ``load_weights`` selects its own tensor-parallel shard, so pass the
-          full (unsharded) checkpoint-format state dict. **Caveat:** references
-          are passed by-reference only with an **in-process** engine (TP=1, no
-          multiprocessing); with MP/TP workers the tensors are serialized to
-          each worker. For distributed GPU-to-GPU weight sync prefer the NCCL
-          weight-transfer path (``--weight-transfer-backend nccl`` + the
-          ``/v1/admin/rlhf/*`` endpoints).
+        * ``state_dict`` -- in-memory HF named parameters, with **no disk
+          round-trip**. Accepts a live ``nn.Module`` (e.g. a HuggingFace model
+          -- its ``state_dict()`` is called for you), a ``{name: tensor}``
+          mapping, or any iterable of ``(name, tensor)`` pairs. The tensors are
+          moved to host and shipped to the engine as a ``safetensors`` blob
+          (raw tensors do not survive the engine's RPC/IPC boundary -- they
+          degrade to lists). Each worker decodes the blob and ``load_weights``
+          maps the HF names into vLLM's pre-allocated, repacked (fused/sharded)
+          buffers, keeping only its tensor-parallel shard, so pass the full
+          (unsharded) state dict. This involves one host-side copy
+          (serialization); for high-frequency, zero-copy GPU-to-GPU sync prefer
+          the NCCL weight-transfer path (``--weight-transfer-backend nccl`` +
+          the ``/v1/admin/rlhf/*`` endpoints), or run vLLM in-process
+          (``distributed_executor_backend="external_launcher"``) and pass
+          ``param.data`` by reference, as TRL's colocate mode does.
         * ``weights_path`` -- a local checkpoint dir or Hugging Face id.
         * neither -- reload from the engine's original model path.
 
@@ -858,13 +858,25 @@ class LLM(
 
         if state_dict is not None:
             src = state_dict
-            # Accept a live module (e.g. a HF model) directly: pull references
-            # to its parameters via state_dict() -- this copies no weight data.
+            # Accept a live module (e.g. a HF model) directly via state_dict().
             if hasattr(src, "state_dict") and callable(src.state_dict):
                 src = src.state_dict()
             items = src.items() if hasattr(src, "items") else src
+            # Ship the HF-named params as a safetensors blob: raw tensors do not
+            # survive the engine's RPC/IPC boundary (they degrade to lists),
+            # whereas bytes round-trip intact. ``.clone()`` breaks any shared
+            # storage (e.g. tied input/output embeddings) so safetensors can
+            # serialize them. The worker decodes the blob and ``load_weights``
+            # maps HF names to the vLLM (fused/sharded) layout, keeping only
+            # each tensor-parallel rank's shard. (Same ``model.load_weights``
+            # endpoint TRL uses for weight sync.)
+            from safetensors.torch import save as _safetensors_save
+
+            tensors = {
+                name: t.detach().cpu().clone() for name, t in items
+            }
             kwargs: dict[str, Any] = {
-                "weights_iterator": list(items),
+                "weights_bytes": _safetensors_save(tensors),
                 "is_checkpoint_format": is_checkpoint_format,
             }
         elif weights_path is not None:

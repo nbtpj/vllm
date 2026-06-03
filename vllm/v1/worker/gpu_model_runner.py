@@ -5319,16 +5319,34 @@ class GPUModelRunner(
         weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
         weights_path: str | None = None,
         is_checkpoint_format: bool = True,
+        weights_bytes: bytes | None = None,
     ) -> None:
         """
-        Reload weights from a weights iterator or from disk
+        Reload weights from a weights iterator, an in-memory safetensors blob,
+        or from disk.
 
         :param weights_iterator: weights to load into model
         :param weights_path: path to load weights from if weights_iterator is not
             provided. Use path of original model if neither is provided.
         :param is_checkpoint_format: set to False if weights have already been processed
             into kernel format (repacking, renaming, etc.)
+        :param weights_bytes: in-memory ``safetensors`` serialization of an HF
+            named-parameter state dict. Used to ship in-RAM weights across the
+            engine IPC boundary intact (raw tensors do not survive RPC
+            serialization). Decoded here into ``weights_iterator``; the model's
+            ``load_weights`` then maps HF names to the vLLM (fused/sharded)
+            layout, so each worker keeps only its tensor-parallel shard.
         """
+        # In-memory HF state dict shipped as safetensors bytes (RPC-safe).
+        if weights_bytes is not None:
+            from safetensors.torch import load as _safetensors_load
+
+            if weights_iterator is not None:
+                raise ValueError(
+                    "pass at most one of weights_iterator / weights_bytes"
+                )
+            weights_iterator = list(_safetensors_load(weights_bytes).items())
+
         # TODO(@kylesayrs): generalize to all runners and loaders
         # argument validation
         if weights_iterator is None and not is_checkpoint_format:
