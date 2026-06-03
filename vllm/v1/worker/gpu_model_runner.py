@@ -5376,6 +5376,14 @@ class GPUModelRunner(
                     "Reloading weights inplace via the %s loader...",
                     self.load_config.load_format,
                 )
+                # These loaders stamp non-overwritable attributes on params at
+                # load time (e.g. bitsandbytes' ``bnb_quant_state``). Clear them
+                # so the in-place reload can re-stamp them without tripping
+                # ``set_weight_attrs``' no-overwrite assertion.
+                for _, param in model.named_parameters():
+                    for attr in ("bnb_quant_state", "bnb_shard_offsets"):
+                        if hasattr(param, attr):
+                            delattr(param, attr)
                 model_loader.load_weights(model, self.model_config)
                 return
 
