@@ -42,7 +42,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.v1.engine import (
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -63,6 +63,14 @@ _CHILD_SEP = "\x00cr"
 # Abuse guards for payloads arriving via public endpoints.
 MAX_CANDIDATES = 1024
 MAX_CANDIDATE_TOKENS = 4096
+
+# Sentinel candidate index marking a fast (single-child) step: one request
+# scores every remaining single-token candidate via logprob_token_ids.
+FAST_STEP = -1
+
+# Sentinel vocab rank for "not the argmax" on the fast step (exact rank is
+# unknown; ranks only feed is_greedy-style checks downstream).
+NOT_GREEDY_RANK = 2
 
 
 def get_choice_rank_payload(request: Request) -> dict[str, Any] | None:
@@ -210,6 +218,19 @@ class ChoiceRankCoordinator:
     def _spawn_step(self, group: _RankGroup) -> None:
         group.pending.clear()
         group.results.clear()
+        # Fast step: when every remaining candidate is a single token, one
+        # request on the bare context with logprob_token_ids scores the
+        # whole pool in a single forward (pool-size fewer children). The
+        # coordinator decides per step, so mixed pools upgrade dynamically
+        # once their multi-token bundles have been selected.
+        ids = [c[0] for _, c in group.remaining]
+        if (
+            all(len(c) == 1 for _, c in group.remaining)
+            and all(t != 0 for t in ids)
+            and len(set(ids)) <= MAX_LOGPROB_TOKEN_IDS
+        ):
+            self._spawn_fast_step(group, ids)
+            return
         context_len = len(group.context)
         for orig_idx, cand in group.remaining:
             child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.{orig_idx}"
@@ -232,6 +253,33 @@ class ChoiceRankCoordinator:
             self.child_to_parent[child_id] = group.parent_id
             group.pending[child_id] = orig_idx
             self.core.scheduler.add_request(child)
+
+    def _spawn_fast_step(self, group: _RankGroup, ids: list[int]) -> None:
+        child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.fast"
+        child_ecr = EngineCoreRequest(
+            request_id=child_id,
+            prompt_token_ids=list(group.context),
+            mm_features=None,
+            sampling_params=SamplingParams(
+                max_tokens=1,
+                temperature=0.0,
+                logprob_token_ids=sorted(set(ids)),
+                detokenize=False,
+            ),
+            pooling_params=None,
+            arrival_time=group.arrival_time,
+            lora_request=group.lora_request,
+            cache_salt=None,
+            data_parallel_rank=None,
+            client_index=group.client_index,
+            priority=group.priority,
+        )
+        child = Request.from_engine_core_request(
+            child_ecr, self.core.request_block_hasher
+        )
+        self.child_to_parent[child_id] = group.parent_id
+        group.pending[child_id] = FAST_STEP
+        self.core.scheduler.add_request(child)
 
     # ------------------------------------------------------------------ #
     # output interception
@@ -287,15 +335,36 @@ class ChoiceRankCoordinator:
             self.child_to_parent.pop(out.request_id, None)
             return
 
-        tensors = out.new_prompt_logprobs_tensors
         pending_idx = group.pending.get(out.request_id)
-        if tensors is not None and pending_idx is not None:
-            # Windowed rows: row j is candidate token j. Column 0 holds the
-            # target token's logprob; selected_token_ranks its vocab rank.
-            group.results[pending_idx] = (
-                tensors.logprobs[:, 0].tolist(),
-                tensors.selected_token_ranks.tolist(),
-            )
+        if pending_idx == FAST_STEP:
+            # Fast step: one child scored every remaining single-token
+            # candidate via logprob_token_ids (sample logprobs, row 0).
+            lists = out.new_logprobs
+            if lists is not None and len(lists.logprob_token_ids):
+                lp_map = {
+                    int(t): float(lp)
+                    for t, lp in zip(lists.logprob_token_ids[0], lists.logprobs[0])
+                }
+                sampled = out.new_token_ids[0] if out.new_token_ids else None
+                ok = True
+                for orig_idx, cand in group.remaining:
+                    logprob = lp_map.get(cand[0])
+                    if logprob is None:
+                        ok = False
+                        break
+                    rank = 1 if cand[0] == sampled else NOT_GREEDY_RANK
+                    group.results[orig_idx] = ([logprob], [rank])
+                if not ok:
+                    group.results.clear()
+        else:
+            tensors = out.new_prompt_logprobs_tensors
+            if tensors is not None and pending_idx is not None:
+                # Windowed rows: row j is candidate token j. Column 0 holds
+                # the target token's logprob; selected_token_ranks its rank.
+                group.results[pending_idx] = (
+                    tensors.logprobs[:, 0].tolist(),
+                    tensors.selected_token_ranks.tolist(),
+                )
         if not out.finished:
             return
 
@@ -303,7 +372,12 @@ class ChoiceRankCoordinator:
         self.child_to_parent.pop(out.request_id, None)
         if orig_idx is None:
             return
-        if orig_idx not in group.results:
+        scored = (
+            len(group.results) == len(group.remaining)
+            if orig_idx == FAST_STEP
+            else orig_idx in group.results
+        )
+        if not scored:
             # Child finished without producing logprobs (e.g. aborted by
             # the engine). Fail the whole group rather than mis-rank.
             self._finalize(

@@ -76,9 +76,32 @@ def make_parent(prompt, candidates, k, select_by="mean", request_id="parent-0"):
 
 
 def child_output(child: Request, finished=True) -> EngineCoreOutput:
-    """Fabricate the windowed-logprob output the runner would produce."""
+    """Fabricate the output the runner would produce for a child."""
+    import numpy as np
+
+    from vllm.v1.engine import FinishReason
+    from vllm.v1.outputs import LogprobsLists
+
     sp = child.sampling_params
-    assert sp is not None and sp.prompt_logprobs_from is not None
+    assert sp is not None
+    if sp.logprob_token_ids:
+        # Fast step: sample logprobs for the requested ids (+ sampled).
+        ids = list(sp.logprob_token_ids)
+        sampled = max(ids, key=lambda t: TABLE[t])
+        row_ids = [sampled, *ids]
+        row_lps = [TABLE[t] for t in row_ids]
+        lists = LogprobsLists(
+            logprob_token_ids=np.array([row_ids]),
+            logprobs=np.array([row_lps]),
+            sampled_token_ranks=np.array([1]),
+        )
+        return EngineCoreOutput(
+            request_id=child.request_id,
+            new_token_ids=[sampled],
+            new_logprobs=lists,
+            finish_reason=FinishReason.LENGTH if finished else None,
+        )
+    assert sp.prompt_logprobs_from is not None
     cand = child.prompt_token_ids[sp.prompt_logprobs_from :]
     logprobs = torch.tensor([[TABLE[t]] for t in cand], dtype=torch.float32)
     tensors = LogprobsTensors(
@@ -226,7 +249,7 @@ def test_child_outputs_filtered_from_client_stream():
 def test_abort_parent_tears_down_children():
     core = FakeCore()
     coord = ChoiceRankCoordinator(core)
-    coord.try_intercept(make_parent([1], [[10], [11], [12]], k=2))
+    coord.try_intercept(make_parent([1], [[10, 11], [11, 12], [12, 20]], k=2))
     assert len(core.scheduler.queue) == 3
     coord.handle_aborts(["parent-0"])
     assert not coord.groups
@@ -239,8 +262,9 @@ def test_child_failure_produces_error_result():
 
     core = FakeCore()
     coord = ChoiceRankCoordinator(core)
-    coord.try_intercept(make_parent([1], [[10], [11]], k=1))
+    coord.try_intercept(make_parent([1], [[10, 11], [11, 12]], k=1))
     children = list(core.scheduler.queue)
+    assert len(children) == 2
     core.scheduler.queue = []
     # First child finishes WITHOUT logprobs (e.g. internal abort).
     bad = EngineCoreOutput(
@@ -263,3 +287,47 @@ def test_validate_payload_messages():
     assert "select_by" in validate_payload(
         {"candidates": [[1]], "k": 1, "select_by": "max"}
     )
+
+
+def test_single_token_pool_uses_fast_step():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    candidates = [[10], [11], [12]]
+    coord.try_intercept(make_parent([1, 2], candidates, k=3))
+    # One fast child per step instead of pool-size children.
+    assert len(core.scheduler.queue) == 1
+    child = core.scheduler.queue[0]
+    assert child.sampling_params.logprob_token_ids == [10, 11, 12]
+    assert child.prompt_token_ids == [1, 2]
+
+    outs = drive(core, coord)
+    result = outs[0].choice_rank_result
+    orders = [s["choice_index"] for s in result["selected"]]
+    ref_orders, _ = reference_orders([1, 2], candidates, 3)
+    assert orders == ref_orders
+    # Per-step logprobs match the table.
+    for step in result["selected"]:
+        assert step["token_logprobs"] == [TABLE[candidates[step["choice_index"]][0]]]
+
+
+def test_mixed_pool_upgrades_to_fast_step():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    # One multi-token bundle that wins step 0; the rest single tokens.
+    candidates = [[20, 11], [10], [12]]
+    coord.try_intercept(make_parent([1], candidates, k=3))
+    # Step 0 is teacher-forced (mixed pool): 3 children.
+    assert len(core.scheduler.queue) == 3
+    children = list(core.scheduler.queue)
+    core.scheduler.queue = []
+    coord.process_outputs(
+        {0: EngineCoreOutputs(outputs=[child_output(c) for c in children])}
+    )
+    # [20, 11] (mean -0.75) won; remaining pool is all single-token ->
+    # step 1 upgrades to a single fast child.
+    assert len(core.scheduler.queue) == 1
+    assert core.scheduler.queue[0].sampling_params.logprob_token_ids == [10, 12]
+    outs = drive(core, coord)
+    orders = [s["choice_index"] for s in outs[0].choice_rank_result["selected"]]
+    ref_orders, _ = reference_orders([1], candidates, 3)
+    assert orders == ref_orders
