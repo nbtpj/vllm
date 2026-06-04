@@ -23,9 +23,15 @@ import itertools
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
+import vllm.envs as envs
 from vllm.entrypoints.choice_scoring.batching import (
     rank_batch,
     score_choices_batch,
+)
+from vllm.entrypoints.choice_scoring.fast_path import (
+    extract_single_token_results,
+    partition_single_token_groups,
+    split_priming_wave,
 )
 from vllm.entrypoints.choice_scoring.inputs import (
     RawChoice,
@@ -51,6 +57,7 @@ from vllm.entrypoints.choice_scoring.wavefront import (
 )
 from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
+from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.utils import random_uuid
 
 if TYPE_CHECKING:
@@ -129,7 +136,64 @@ class ChoiceScoringOfflineMixin:
                 lora_request=lora_request,
             )
 
-        return make_prompt_logprobs_score_batch_fn(_generate_fn, num_prompt_logprobs)
+        reference_fn = make_prompt_logprobs_score_batch_fn(
+            _generate_fn, num_prompt_logprobs
+        )
+
+        def _fast_generate(groups):
+            # One request per context: logprob_token_ids returns every
+            # single-token candidate's logprob from one forward.
+            prompts = [TokensPrompt(prompt_token_ids=list(g.context)) for g in groups]
+            params = [
+                SamplingParams(
+                    max_tokens=1,
+                    temperature=0.0,
+                    logprob_token_ids=list(g.cand_ids),
+                    detokenize=False,
+                )
+                for g in groups
+            ]
+            outs = self.generate(
+                prompts, params, use_tqdm=use_tqdm, lora_request=lora_request
+            )
+            results = []
+            for g, out in zip(groups, outs):
+                completion = out.outputs[0]
+                results.append(
+                    extract_single_token_results(
+                        g,
+                        completion.token_ids[0],
+                        completion.logprobs[0] if completion.logprobs else None,
+                    )
+                )
+            return results
+
+        def _score_batch(pairs):
+            if not envs.VLLM_ENABLE_NATIVE_CHOICE_SCORING:
+                return reference_fn(pairs)
+
+            results: list = [None] * len(pairs)
+            fast_groups: list = []
+            slow_idx = list(range(len(pairs)))
+            if num_prompt_logprobs == 0:
+                fast_groups, slow_idx = partition_single_token_groups(pairs)
+            if fast_groups:
+                for g, rs in zip(fast_groups, _fast_generate(fast_groups)):
+                    for i, r in zip(g.pair_indices, rs):
+                        results[i] = r
+            if slow_idx:
+                # Context-priming: wave 1 caches each shared context once,
+                # wave 2 siblings hit those blocks instead of re-prefilling.
+                slow_pairs = [pairs[i] for i in slow_idx]
+                for wave in split_priming_wave(slow_pairs):
+                    if not wave:
+                        continue
+                    sub = [slow_pairs[j] for j in wave]
+                    for j, r in zip(wave, reference_fn(sub)):
+                        results[slow_idx[j]] = r
+            return results
+
+        return _score_batch
 
     def _prepare(
         self,
@@ -214,8 +278,27 @@ class ChoiceScoringOfflineMixin:
                 pids, cands, max_len, extra_growth=_largest_growth(cands, ki)
             )
 
+        # All-single-token pools ride the logprob_token_ids fast path: each
+        # rank step is then ONE request per prompt (instead of pool-size
+        # teacher-forced sequences), so the lock-step driver with the fast
+        # scorer beats the per-pair wavefront outright.
+        all_single_token = (
+            envs.VLLM_ENABLE_NATIVE_CHOICE_SCORING
+            and num_prompt_logprobs == 0
+            and all(
+                len(c.token_ids) == 1 and c.token_ids[0] != 0
+                for cands in cand_lists
+                for c in cands
+            )
+            and all(len(cands) <= MAX_LOGPROB_TOKEN_IDS for cands in cand_lists)
+        )
         engine = getattr(self, "llm_engine", None)
-        if (
+        if all_single_token:
+            score_batch_fn = self._make_score_batch_fn(
+                num_prompt_logprobs, use_tqdm, lora_request
+            )
+            outputs = rank_batch(prompt_ids, cand_lists, ks, score_batch_fn, select_by)
+        elif (
             engine is not None
             and hasattr(engine, "add_request")
             and hasattr(engine, "step")

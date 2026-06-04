@@ -126,6 +126,21 @@ context. With the window, the KV cache manager caps the cache hit just below
 the window start, so the shared context KV is genuinely reused across a
 prompt's choices and across rank steps.
 
+The flag enables two further request-level optimizations:
+
+- **Single-token fast path** -- when *all* of a prompt's choices are single
+  tokens (the classic A/B/C/D case), no teacher forcing is needed: one
+  request on the bare prompt with `SamplingParams.logprob_token_ids` returns
+  every choice's logprob (and the argmax token, hence exact `is_greedy`)
+  from a single forward. N choices collapse from N sequences to **1
+  request** -- including every step of `batch_rank` over single-token pools.
+  Falls back to teacher forcing when `num_prompt_logprobs > 0`, a choice is
+  token id 0, or there are more than 128 choices.
+- **Context-priming waves** -- multi-token choice groups are scored in two
+  waves: wave 1 sends one pair per context (computing and caching the
+  context blocks), wave 2 sends the siblings, which then hit the cache
+  instead of re-prefilling the same context in parallel.
+
 Outputs are semantically identical (parity-tested against the default path;
 small fp deviations are possible in low-precision dtypes because the LM head
 runs over a different batch shape). The flag is off by default until you have

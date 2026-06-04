@@ -21,10 +21,16 @@ from collections.abc import AsyncGenerator, Mapping
 from fastapi import Request
 from pydantic import Field
 
+import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.choice_scoring.async_batching import (
     rank_batch_pipelined_async,
     score_choices_batch_async,
+)
+from vllm.entrypoints.choice_scoring.fast_path import (
+    extract_single_token_results,
+    partition_single_token_groups,
+    split_priming_wave,
 )
 from vllm.entrypoints.choice_scoring.inputs import (
     normalize_choices,
@@ -50,6 +56,7 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
+from vllm.sampling_params import SamplingParams
 from vllm.tracing import (
     contains_trace_headers,
     extract_trace_headers,
@@ -202,40 +209,95 @@ class ServingChoiceScoring(OpenAIServing):
         # steps (pipelined driver) can never collide on request ids.
         call_counter = itertools.count()
 
-        async def _score_batch(pairs):
-            call_idx = next(call_counter)
-            sequences = [list(ctx) + list(cand) for ctx, cand in pairs]
-            token_counter[0] += sum(len(s) for s in sequences)
-
+        async def _generate_many(prompts_and_params, tag: str):
             generators: list[AsyncGenerator[RequestOutput, None]] = []
-            for i, ((ctx, _), seq) in enumerate(zip(pairs, sequences)):
-                sampling_params = make_scoring_sampling_params(
-                    num_prompt_logprobs, context_len=len(ctx)
-                )
+            for i, (prompt, sampling_params) in enumerate(prompts_and_params):
                 generators.append(
                     self.engine_client.generate(
-                        tokens_input(seq),
+                        prompt,
                         sampling_params,
-                        f"{request_id}-{call_idx}-{i}",
+                        f"{request_id}-{tag}-{i}",
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         priority=priority,
                     )
                 )
-
-            results: list[RequestOutput | None] = [None] * len(sequences)
+            results: list[RequestOutput | None] = [None] * len(generators)
             async for i, res in merge_async_iterators(*generators):
                 results[i] = res
-
-            out = []
-            for i, (ctx, cand) in enumerate(pairs):
-                res = results[i]
+            for i, res in enumerate(results):
                 if res is None:
-                    raise ValueError(f"no result for scoring pair {i}")
-                out.append(
-                    extract_continuation_logprobs(res.prompt_logprobs, len(ctx), cand)
+                    raise ValueError(f"no result for scoring request {tag}-{i}")
+            return results
+
+        async def _score_reference(pairs, tag: str):
+            sequences = [list(ctx) + list(cand) for ctx, cand in pairs]
+            token_counter[0] += sum(len(s) for s in sequences)
+            prompts_and_params = [
+                (
+                    tokens_input(seq),
+                    make_scoring_sampling_params(
+                        num_prompt_logprobs, context_len=len(ctx)
+                    ),
                 )
-            return out
+                for (ctx, _), seq in zip(pairs, sequences)
+            ]
+            results = await _generate_many(prompts_and_params, tag)
+            return [
+                extract_continuation_logprobs(res.prompt_logprobs, len(ctx), cand)
+                for (ctx, cand), res in zip(pairs, results)
+            ]
+
+        async def _score_batch(pairs):
+            call_idx = next(call_counter)
+            if not envs.VLLM_ENABLE_NATIVE_CHOICE_SCORING:
+                return await _score_reference(pairs, str(call_idx))
+
+            results: list = [None] * len(pairs)
+            fast_groups: list = []
+            slow_idx = list(range(len(pairs)))
+            if num_prompt_logprobs == 0:
+                fast_groups, slow_idx = partition_single_token_groups(pairs)
+            if fast_groups:
+                # One request per context; logprob_token_ids returns every
+                # single-token candidate's logprob from a single forward.
+                token_counter[0] += sum(
+                    len(g.context) + len(g.cand_ids) for g in fast_groups
+                )
+                prompts_and_params = [
+                    (
+                        tokens_input(list(g.context)),
+                        SamplingParams(
+                            max_tokens=1,
+                            temperature=0.0,
+                            logprob_token_ids=list(g.cand_ids),
+                            detokenize=False,
+                        ),
+                    )
+                    for g in fast_groups
+                ]
+                outs = await _generate_many(prompts_and_params, f"{call_idx}-fast")
+                for g, res in zip(fast_groups, outs):
+                    completion = res.outputs[0]
+                    extracted = extract_single_token_results(
+                        g,
+                        completion.token_ids[0],
+                        completion.logprobs[0] if completion.logprobs else None,
+                    )
+                    for i, r in zip(g.pair_indices, extracted):
+                        results[i] = r
+            if slow_idx:
+                # Context-priming: wave 1 caches each shared context once,
+                # wave 2 siblings hit those blocks instead of re-prefilling.
+                slow_pairs = [pairs[i] for i in slow_idx]
+                for w, wave in enumerate(split_priming_wave(slow_pairs)):
+                    if not wave:
+                        continue
+                    sub = [slow_pairs[j] for j in wave]
+                    rs = await _score_reference(sub, f"{call_idx}-w{w}")
+                    for j, r in zip(wave, rs):
+                        results[slow_idx[j]] = r
+            return results
 
         return _score_batch
 

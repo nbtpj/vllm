@@ -236,3 +236,29 @@ def test_native_window_batch_parity(llm: LLM, monkeypatch):
         assert on.best_choice_index == ob.best_choice_index
         for cb, cn in zip(ob.choices, on.choices):
             assert cn.token_logprobs == pytest.approx(cb.token_logprobs, abs=5e-3)
+
+
+@pytest.mark.skip_global_cleanup
+def test_native_fast_path_single_token_parity(llm: LLM, monkeypatch):
+    # All-single-token pool: flag-on uses ONE logprob_token_ids request per
+    # prompt (score) / per step (rank) instead of teacher forcing. Results
+    # must match the reference path, including exact is_greedy.
+    single_choices = [" Paris", " London", " Berlin"]
+    tok = llm.get_tokenizer()
+    assert all(
+        len(tok.encode(c, add_special_tokens=False)) == 1 for c in single_choices
+    )
+    monkeypatch.delenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", raising=False)
+    base_s = llm.batch_score(PROMPT, single_choices)
+    base_r = llm.batch_rank(PROMPT, single_choices, k=3)
+    monkeypatch.setenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", "1")
+    fast_s = llm.batch_score(PROMPT, single_choices)
+    fast_r = llm.batch_rank(PROMPT, single_choices, k=3)
+    assert fast_s.best_choice_index == base_s.best_choice_index
+    for cb, cf in zip(base_s.choices, fast_s.choices):
+        assert cf.token_ids == cb.token_ids
+        assert cf.token_logprobs == pytest.approx(cb.token_logprobs, abs=5e-3)
+        assert cf.is_greedy == cb.is_greedy
+    assert [s.choice_index for s in fast_r.selected] == [
+        s.choice_index for s in base_r.selected
+    ]
