@@ -13,10 +13,16 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from vllm.entrypoints.choice_scoring.core import (
+    aggregate_choice,
+    select_best_index,
+)
 from vllm.entrypoints.choice_scoring.params import (
     Candidate,
     RankOutput,
     RankStep,
+    ScoreChoicesOutput,
+    SelectBy,
 )
 from vllm.sampling_params import SamplingParams
 
@@ -82,4 +88,53 @@ def build_rank_output(
         prompt_token_ids=list(prompt_token_ids),
         selected=selected,
         truncated=bool(result["truncated"]),
+    )
+
+
+def make_native_score_params(candidates: Sequence[Candidate]) -> SamplingParams:
+    """SamplingParams for one engine-resident score parent request."""
+    payload: dict[str, Any] = {
+        "candidates": [list(c.token_ids) for c in candidates],
+    }
+    return SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        detokenize=False,
+        extra_args={"choice_score": payload},
+    )
+
+
+def build_score_output(
+    prompt_token_ids: Sequence[int],
+    candidates: Sequence[Candidate],
+    result: dict[str, Any] | None,
+    select_by: SelectBy = "mean",
+) -> ScoreChoicesOutput:
+    """Convert an engine ``choice_score`` result into a ScoreChoicesOutput."""
+    if result is None:
+        raise RuntimeError(
+            "engine returned no choice score result; the connected engine "
+            "does not support engine-resident scoring (unset "
+            "VLLM_ENABLE_NATIVE_CHOICE_SCORING to use the client-side path)"
+        )
+    if "error" in result:
+        raise ValueError(f"engine rejected choice_score request: {result['error']}")
+
+    by_index = {c["index"]: c for c in result["choices"]}
+    scored = []
+    for i, cand in enumerate(candidates):
+        entry = by_index.get(i)
+        if entry is None:
+            raise RuntimeError(f"engine returned no score for candidate {i}")
+        scored.append(
+            aggregate_choice(
+                cand,
+                [float(lp) for lp in entry["token_logprobs"]],
+                [int(r) for r in entry["ranks"]],
+            )
+        )
+    return ScoreChoicesOutput(
+        prompt_token_ids=list(prompt_token_ids),
+        choices=scored,
+        best_choice_index=select_best_index(scored, select_by),
     )

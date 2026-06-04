@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 EXTRA_ARGS_KEY = "choice_rank"
+SCORE_EXTRA_ARGS_KEY = "choice_score"
 # Separator that cannot appear in client-supplied request ids.
 _CHILD_SEP = "\x00cr"
 
@@ -68,24 +69,35 @@ MAX_CANDIDATE_TOKENS = 4096
 # scores every remaining single-token candidate via logprob_token_ids.
 FAST_STEP = -1
 
+# Sentinel marking a decode-fused run: ONE decode request performs every
+# remaining selection step (greedy decoding over a shrinking allowed set).
+DECODE_RUN = -2
+
 # Sentinel vocab rank for "not the argmax" on the fast step (exact rank is
 # unknown; ranks only feed is_greedy-style checks downstream).
 NOT_GREEDY_RANK = 2
 
 
-def get_choice_rank_payload(request: Request) -> dict[str, Any] | None:
-    """Return the choice-rank payload if this request carries one."""
+def get_choice_payload(
+    request: Request,
+) -> tuple[str, dict[str, Any]] | None:
+    """Return ("rank"|"score", payload) if this request carries one."""
     params = request.sampling_params
     if params is None or not params.extra_args:
         return None
     payload = params.extra_args.get(EXTRA_ARGS_KEY)
-    return payload if isinstance(payload, dict) else None
+    if isinstance(payload, dict):
+        return "rank", payload
+    payload = params.extra_args.get(SCORE_EXTRA_ARGS_KEY)
+    if isinstance(payload, dict):
+        return "score", payload
+    return None
 
 
-def validate_payload(payload: dict[str, Any]) -> str | None:
+def validate_payload(payload: dict[str, Any], mode: str = "rank") -> str | None:
     """Return an error string for an invalid payload, else None."""
     candidates = payload.get("candidates")
-    k = payload.get("k")
+    k = payload.get("k") if mode == "rank" else 1
     select_by = payload.get("select_by", "mean")
     if (
         not isinstance(candidates, list)
@@ -109,9 +121,10 @@ def validate_payload(payload: dict[str, Any]) -> str | None:
 
 
 class _RankGroup:
-    """In-core state for one rank request."""
+    """In-core state for one rank or score request."""
 
-    def __init__(self, parent: Request, payload: dict[str, Any]):
+    def __init__(self, parent: Request, payload: dict[str, Any], mode: str = "rank"):
+        self.mode = mode
         self.parent_id = parent.request_id
         self.client_index = parent.client_index
         self.arrival_time = parent.arrival_time
@@ -124,13 +137,18 @@ class _RankGroup:
         self.remaining: list[tuple[int, list[int]]] = [
             (i, list(c)) for i, c in enumerate(candidates)
         ]
-        k: int = payload["k"]
+        k: int = payload["k"] if mode == "rank" else 1
         self.select_by: str = payload.get("select_by", "mean")
         self.truncated = k > len(self.remaining)
         self.target = min(k, len(self.remaining))
+        # Score groups score multi-token pools in two waves: wave 0 primes
+        # the shared-context KV with one candidate; wave 1 siblings hit it.
+        self.phase = 0
 
         self.step = 0
         self.selected: list[dict[str, Any]] = []
+        # Decode-fused run accumulators (token, logprob, rank per step).
+        self.decode_acc: list[tuple[int, float, int]] = []
         # child_id -> original candidate index (this step)
         self.pending: dict[str, int] = {}
         # original candidate index -> (token_logprobs, ranks)
@@ -183,12 +201,13 @@ class ChoiceRankCoordinator:
     # ------------------------------------------------------------------ #
     def try_intercept(self, request: Request) -> bool:
         """If ``request`` is a rank parent, take ownership and return True."""
-        payload = get_choice_rank_payload(request)
-        if payload is None:
+        kind = get_choice_payload(request)
+        if kind is None:
             return False
-        error = validate_payload(payload)
+        mode, payload = kind
+        error = validate_payload(payload, mode)
         if error is None and request.prompt_token_ids is None:
-            error = "choice_rank requires a token-ids prompt"
+            error = "choice scoring requires a token-ids prompt"
         if error is not None:
             logger.warning(
                 "Rejecting choice_rank request %s: %s", request.request_id, error
@@ -201,9 +220,12 @@ class ChoiceRankCoordinator:
             )
             return True
 
-        group = _RankGroup(request, payload)
+        group = _RankGroup(request, payload, mode)
         self.groups[group.parent_id] = group
-        self._spawn_step(group)
+        if mode == "score":
+            self._spawn_score(group)
+        else:
+            self._spawn_step(group)
         return True
 
     def _child_params(self, context_len: int) -> SamplingParams:
@@ -218,11 +240,37 @@ class ChoiceRankCoordinator:
     def _spawn_step(self, group: _RankGroup) -> None:
         group.pending.clear()
         group.results.clear()
-        # Fast step: when every remaining candidate is a single token, one
-        # request on the bare context with logprob_token_ids scores the
-        # whole pool in a single forward (pool-size fewer children). The
-        # coordinator decides per step, so mixed pools upgrade dynamically
-        # once their multi-token bundles have been selected.
+        # Single-token planning. The coordinator decides per step, so mixed
+        # pools upgrade dynamically once their multi-token bundles have been
+        # selected:
+        # - decode-fused run: when every remaining candidate is a unique
+        #   single token and >= 2 steps remain, ONE decode request performs
+        #   all remaining steps (greedy decoding over a shrinking allowed
+        #   set -- the rank loop becomes ordinary decode steps on the
+        #   CUDA-graph path). Gated off under speculative decoding (the
+        #   masking processor has no draft-row support).
+        # - fast step: otherwise, when all remaining are single tokens, one
+        #   request with logprob_token_ids scores the pool in one forward.
+        ids = [c[0] for _, c in group.remaining]
+        all_single = all(len(c) == 1 for _, c in group.remaining) and all(
+            t != 0 for t in ids
+        )
+        steps_left = group.target - group.step
+        if (
+            all_single
+            and steps_left >= 2
+            and len(set(ids)) == len(ids)
+            and self.core.vllm_config.speculative_config is None
+        ):
+            self._spawn_decode_run(group, ids, steps_left)
+            return
+        if all_single and len(set(ids)) <= MAX_LOGPROB_TOKEN_IDS:
+            self._spawn_fast_step(group, ids)
+            return
+        self._spawn_scoring_children(group, group.remaining)
+
+    def _spawn_score(self, group: _RankGroup) -> None:
+        """Spawn the (single) scoring wave plan for a score group."""
         ids = [c[0] for _, c in group.remaining]
         if (
             all(len(c) == 1 for _, c in group.remaining)
@@ -231,8 +279,20 @@ class ChoiceRankCoordinator:
         ):
             self._spawn_fast_step(group, ids)
             return
+        if group.phase == 0 and len(group.remaining) >= 2 and len(group.context) >= 32:
+            # Wave 0: prime the shared-context KV with one candidate; the
+            # siblings (wave 1) then hit the cached blocks instead of all
+            # re-prefilling the context in parallel.
+            self._spawn_scoring_children(group, group.remaining[:1])
+            return
+        unscored = [it for it in group.remaining if it[0] not in group.results]
+        self._spawn_scoring_children(group, unscored)
+
+    def _spawn_scoring_children(
+        self, group: _RankGroup, items: list[tuple[int, list[int]]]
+    ) -> None:
         context_len = len(group.context)
-        for orig_idx, cand in group.remaining:
+        for orig_idx, cand in items:
             child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.{orig_idx}"
             child_ecr = EngineCoreRequest(
                 request_id=child_id,
@@ -253,6 +313,38 @@ class ChoiceRankCoordinator:
             self.child_to_parent[child_id] = group.parent_id
             group.pending[child_id] = orig_idx
             self.core.scheduler.add_request(child)
+
+    def _spawn_decode_run(
+        self, group: _RankGroup, ids: list[int], steps_left: int
+    ) -> None:
+        child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.decode"
+        child_ecr = EngineCoreRequest(
+            request_id=child_id,
+            prompt_token_ids=list(group.context),
+            mm_features=None,
+            sampling_params=SamplingParams(
+                max_tokens=steps_left,
+                temperature=0.0,
+                logprobs=0,
+                ignore_eos=True,
+                detokenize=False,
+                extra_args={"shrinking_allowed_token_ids": list(ids)},
+            ),
+            pooling_params=None,
+            arrival_time=group.arrival_time,
+            lora_request=group.lora_request,
+            cache_salt=None,
+            data_parallel_rank=None,
+            client_index=group.client_index,
+            priority=group.priority,
+        )
+        child = Request.from_engine_core_request(
+            child_ecr, self.core.request_block_hasher
+        )
+        self.child_to_parent[child_id] = group.parent_id
+        group.pending[child_id] = DECODE_RUN
+        group.decode_acc.clear()
+        self.core.scheduler.add_request(child)
 
     def _spawn_fast_step(self, group: _RankGroup, ids: list[int]) -> None:
         child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.fast"
@@ -336,6 +428,9 @@ class ChoiceRankCoordinator:
             return
 
         pending_idx = group.pending.get(out.request_id)
+        if pending_idx == DECODE_RUN:
+            self._consume_decode_output(group, out)
+            return
         if pending_idx == FAST_STEP:
             # Fast step: one child scored every remaining single-token
             # candidate via logprob_token_ids (sample logprobs, row 0).
@@ -389,6 +484,15 @@ class ChoiceRankCoordinator:
         if group.pending:
             return
 
+        if group.mode == "score":
+            unscored = [it for it in group.remaining if it[0] not in group.results]
+            if unscored:
+                group.phase = 1
+                self._spawn_scoring_children(group, unscored)
+            else:
+                self._finalize(group)
+            return
+
         # Step complete: select, advance, and either respawn or finalize.
         best = group.select_best()
         logprobs, ranks = group.results[best]
@@ -410,14 +514,74 @@ class ChoiceRankCoordinator:
         else:
             self._finalize(group)
 
+    def _consume_decode_output(self, group: _RankGroup, out: EngineCoreOutput) -> None:
+        """Accumulate one decode-fused child's streamed steps; finalize at
+        the end of the run."""
+        lists = out.new_logprobs
+        n_new = len(out.new_token_ids)
+        if n_new and lists is not None and len(lists.logprob_token_ids) == n_new:
+            for j, token in enumerate(out.new_token_ids):
+                group.decode_acc.append(
+                    (
+                        int(token),
+                        float(lists.logprobs[j][0]),
+                        int(lists.sampled_token_ranks[j]),
+                    )
+                )
+        if not out.finished:
+            return
+
+        group.pending.pop(out.request_id, None)
+        self.child_to_parent.pop(out.request_id, None)
+        token_to_remaining = {c[0]: i for i, c in group.remaining}
+        expected = group.target - group.step
+        if len(group.decode_acc) != expected:
+            self._finalize(
+                group,
+                error=f"decode-fused rank produced {len(group.decode_acc)} "
+                f"steps, expected {expected}",
+            )
+            return
+        for token, logprob, rank in group.decode_acc:
+            orig_idx = token_to_remaining.pop(token, None)
+            if orig_idx is None:
+                self._finalize(
+                    group,
+                    error=f"decode-fused rank emitted unexpected token {token}",
+                )
+                return
+            group.selected.append(
+                {
+                    "order": group.step,
+                    "choice_index": orig_idx,
+                    "token_ids": [token],
+                    "token_logprobs": [logprob],
+                    "ranks": [rank],
+                }
+            )
+            group.step += 1
+        self._finalize(group)
+
     def _finalize(self, group: _RankGroup, error: str | None = None) -> None:
-        if error is None:
-            result: dict[str, Any] = {
+        if error is not None:
+            result: dict[str, Any] = {"error": error}
+        elif group.mode == "score":
+            result = {
+                "choices": [
+                    {
+                        "index": orig_idx,
+                        "token_ids": list(cand),
+                        "token_logprobs": group.results[orig_idx][0],
+                        "ranks": group.results[orig_idx][1],
+                    }
+                    for orig_idx, cand in group.remaining
+                ]
+            }
+        else:
+            result = {
                 "selected": group.selected,
                 "truncated": group.truncated,
             }
-        else:
-            result = {"error": error}
         self._abort_group_children(group)
         self.groups.pop(group.parent_id, None)
         self._ready.append(

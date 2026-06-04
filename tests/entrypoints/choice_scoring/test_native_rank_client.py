@@ -8,7 +8,9 @@ import pytest
 
 from vllm.entrypoints.choice_scoring.native import (
     build_rank_output,
+    build_score_output,
     make_native_rank_params,
+    make_native_score_params,
 )
 from vllm.entrypoints.choice_scoring.params import Candidate
 
@@ -65,3 +67,36 @@ def test_build_rank_output_error_and_missing():
         build_rank_output([9], pool, {"error": "bad payload"})
     with pytest.raises(RuntimeError, match="no choice_rank_result"):
         build_rank_output([9], pool, None)
+
+
+def test_score_params_and_output_roundtrip():
+    pool = cands([1, 2], [3])
+    params = make_native_score_params(pool)
+    assert params.extra_args["choice_score"] == {"candidates": [[1, 2], [3]]}
+
+    result = {
+        "choices": [
+            {"index": 1, "token_ids": [3], "token_logprobs": [-0.5], "ranks": [1]},
+            {
+                "index": 0,
+                "token_ids": [1, 2],
+                "token_logprobs": [-1.0, -2.0],
+                "ranks": [2, 1],
+            },
+        ]
+    }
+    out = build_score_output([9], pool, result, "mean")
+    assert out.best_choice_index == 1
+    assert out.choices[0].mean_logprob == pytest.approx(-1.5)
+    assert out.choices[0].is_greedy is False
+    assert out.choices[1].is_greedy is True
+
+
+def test_score_output_error_and_missing():
+    pool = cands([1])
+    with pytest.raises(ValueError, match="rejected"):
+        build_score_output([9], pool, {"error": "nope"})
+    with pytest.raises(RuntimeError, match="no choice score result"):
+        build_score_output([9], pool, None)
+    with pytest.raises(RuntimeError, match="no score for candidate"):
+        build_score_output([9], pool, {"choices": []})

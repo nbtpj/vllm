@@ -18,7 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest
 from vllm.v1.engine.choice_rank import (
     ChoiceRankCoordinator,
-    get_choice_rank_payload,
+    get_choice_payload,
     validate_payload,
 )
 from vllm.v1.outputs import LogprobsTensors
@@ -39,9 +39,12 @@ class FakeScheduler:
 
 
 class FakeCore:
-    def __init__(self):
+    def __init__(self, speculative_config=None):
+        from types import SimpleNamespace
+
         self.scheduler = FakeScheduler()
         self.request_block_hasher = None
+        self.vllm_config = SimpleNamespace(speculative_config=speculative_config)
 
 
 # Per-token logprob assigned to each token id by the fake model.
@@ -84,6 +87,27 @@ def child_output(child: Request, finished=True) -> EngineCoreOutput:
 
     sp = child.sampling_params
     assert sp is not None
+    extra = sp.extra_args or {}
+    if "shrinking_allowed_token_ids" in extra:
+        # Decode-fused run: greedy without replacement over the allowed set.
+        remaining = list(extra["shrinking_allowed_token_ids"])
+        tokens, rows_lp = [], []
+        for _ in range(sp.max_tokens):
+            t = max(remaining, key=lambda x: TABLE[x])
+            remaining.remove(t)
+            tokens.append(t)
+            rows_lp.append([TABLE[t]])
+        lists = LogprobsLists(
+            logprob_token_ids=np.array([[t] for t in tokens]),
+            logprobs=np.array(rows_lp),
+            sampled_token_ranks=np.array([2] * len(tokens)),
+        )
+        return EngineCoreOutput(
+            request_id=child.request_id,
+            new_token_ids=tokens,
+            new_logprobs=lists,
+            finish_reason=FinishReason.LENGTH if finished else None,
+        )
     if sp.logprob_token_ids:
         # Fast step: sample logprobs for the requested ids (+ sampled).
         ids = list(sp.logprob_token_ids)
@@ -222,7 +246,7 @@ def test_non_rank_request_passes_through():
         data_parallel_rank=None,
     )
     request = Request.from_engine_core_request(ecr, None)
-    assert get_choice_rank_payload(request) is None
+    assert get_choice_payload(request) is None
     assert not coord.try_intercept(request)
 
 
@@ -289,15 +313,17 @@ def test_validate_payload_messages():
     )
 
 
-def test_single_token_pool_uses_fast_step():
+def test_single_token_pool_uses_decode_run():
     core = FakeCore()
     coord = ChoiceRankCoordinator(core)
     candidates = [[10], [11], [12]]
     coord.try_intercept(make_parent([1, 2], candidates, k=3))
-    # One fast child per step instead of pool-size children.
+    # ONE decode request performs all 3 steps.
     assert len(core.scheduler.queue) == 1
     child = core.scheduler.queue[0]
-    assert child.sampling_params.logprob_token_ids == [10, 11, 12]
+    sp = child.sampling_params
+    assert sp.extra_args["shrinking_allowed_token_ids"] == [10, 11, 12]
+    assert sp.max_tokens == 3
     assert child.prompt_token_ids == [1, 2]
 
     outs = drive(core, coord)
@@ -305,9 +331,48 @@ def test_single_token_pool_uses_fast_step():
     orders = [s["choice_index"] for s in result["selected"]]
     ref_orders, _ = reference_orders([1, 2], candidates, 3)
     assert orders == ref_orders
-    # Per-step logprobs match the table.
     for step in result["selected"]:
         assert step["token_logprobs"] == [TABLE[candidates[step["choice_index"]][0]]]
+
+
+def test_single_token_pool_k1_uses_fast_step():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    candidates = [[10], [11], [12]]
+    coord.try_intercept(make_parent([1, 2], candidates, k=1))
+    # A single remaining step uses the one-forward fast step.
+    assert len(core.scheduler.queue) == 1
+    assert core.scheduler.queue[0].sampling_params.logprob_token_ids == [10, 11, 12]
+    outs = drive(core, coord)
+    orders = [s["choice_index"] for s in outs[0].choice_rank_result["selected"]]
+    ref_orders, _ = reference_orders([1, 2], candidates, 1)
+    assert orders == ref_orders
+
+
+def test_duplicate_token_ids_fall_back_to_fast_steps():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    # Duplicate single-token candidates cannot ride the decode run
+    # (without-replacement masking could never select the second copy).
+    candidates = [[10], [10], [11]]
+    coord.try_intercept(make_parent([1], candidates, k=3))
+    child = core.scheduler.queue[0]
+    assert child.sampling_params.extra_args is None
+    assert child.sampling_params.logprob_token_ids == [10, 11]
+    outs = drive(core, coord)
+    orders = [s["choice_index"] for s in outs[0].choice_rank_result["selected"]]
+    ref_orders, _ = reference_orders([1], candidates, 3)
+    assert orders == ref_orders
+
+
+def test_spec_decode_disables_decode_run():
+    core = FakeCore(speculative_config=object())
+    coord = ChoiceRankCoordinator(core)
+    coord.try_intercept(make_parent([1], [[10], [11], [12]], k=3))
+    # Falls back to per-step fast steps under speculative decoding.
+    child = core.scheduler.queue[0]
+    assert child.sampling_params.extra_args is None
+    assert child.sampling_params.logprob_token_ids == [10, 11, 12]
 
 
 def test_mixed_pool_upgrades_to_fast_step():
@@ -323,11 +388,90 @@ def test_mixed_pool_upgrades_to_fast_step():
     coord.process_outputs(
         {0: EngineCoreOutputs(outputs=[child_output(c) for c in children])}
     )
-    # [20, 11] (mean -0.75) won; remaining pool is all single-token ->
-    # step 1 upgrades to a single fast child.
+    # [20, 11] (mean -0.75) won; remaining pool is all single-token with
+    # 2 steps left -> upgrades to ONE decode-fused child.
     assert len(core.scheduler.queue) == 1
-    assert core.scheduler.queue[0].sampling_params.logprob_token_ids == [10, 12]
+    sp = core.scheduler.queue[0].sampling_params
+    assert sp.extra_args["shrinking_allowed_token_ids"] == [10, 12]
+    assert sp.max_tokens == 2
     outs = drive(core, coord)
     orders = [s["choice_index"] for s in outs[0].choice_rank_result["selected"]]
     ref_orders, _ = reference_orders([1], candidates, 3)
     assert orders == ref_orders
+
+
+# --------------------------------------------------------------------------- #
+# score mode
+# --------------------------------------------------------------------------- #
+def make_score_parent(prompt, candidates, request_id="parent-s"):
+    params = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        detokenize=False,
+        extra_args={"choice_score": {"candidates": candidates}},
+    )
+    ecr = EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=list(prompt),
+        mm_features=None,
+        sampling_params=params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    return Request.from_engine_core_request(ecr, None)
+
+
+def test_score_mode_returns_all_choices():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    candidates = [[10, 11], [20], [12, 22]]
+    coord.try_intercept(make_score_parent([1, 2], candidates))
+    # Short context (< 32): no priming, all children in one wave.
+    assert len(core.scheduler.queue) == 3
+    outs = drive(core, coord)
+    result = outs[0].choice_rank_result
+    choices = sorted(result["choices"], key=lambda c: c["index"])
+    assert [c["index"] for c in choices] == [0, 1, 2]
+    for c in choices:
+        cand = candidates[c["index"]]
+        assert c["token_ids"] == cand
+        assert c["token_logprobs"] == [TABLE[t] for t in cand]
+        assert len(c["ranks"]) == len(cand)
+
+
+def test_score_mode_priming_waves_on_long_context():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    long_ctx = list(range(100, 140))  # >= 32 tokens
+    candidates = [[10, 11], [20, 21], [12, 22]]
+    coord.try_intercept(make_score_parent(long_ctx, candidates))
+    # Wave 0: a single priming child.
+    assert len(core.scheduler.queue) == 1
+    children = list(core.scheduler.queue)
+    core.scheduler.queue = []
+    coord.process_outputs(
+        {0: EngineCoreOutputs(outputs=[child_output(c) for c in children])}
+    )
+    # Wave 1: the siblings.
+    assert len(core.scheduler.queue) == 2
+    outs = drive(core, coord)
+    result = outs[0].choice_rank_result
+    assert len(result["choices"]) == 3
+
+
+def test_score_mode_single_token_fast_step():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    candidates = [[10], [11], [12]]
+    coord.try_intercept(make_score_parent([1], candidates))
+    assert len(core.scheduler.queue) == 1
+    assert core.scheduler.queue[0].sampling_params.logprob_token_ids == [10, 11, 12]
+    outs = drive(core, coord)
+    result = outs[0].choice_rank_result
+    choices = sorted(result["choices"], key=lambda c: c["index"])
+    assert [c["token_logprobs"][0] for c in choices] == [-3.0, -1.0, -2.0]
+    # Exact greedy info: token 11 is the argmax of the pool.
+    assert [c["ranks"][0] for c in choices] == [2, 1, 2]

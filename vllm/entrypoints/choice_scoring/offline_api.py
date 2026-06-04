@@ -42,7 +42,9 @@ from vllm.entrypoints.choice_scoring.inputs import (
 )
 from vllm.entrypoints.choice_scoring.native import (
     build_rank_output,
+    build_score_output,
     make_native_rank_params,
+    make_native_score_params,
 )
 from vllm.entrypoints.choice_scoring.params import (
     Candidate,
@@ -245,10 +247,26 @@ class ChoiceScoringOfflineMixin:
         for pids, cands in zip(prompt_ids, cand_lists):
             validate_lengths(pids, cands, max_len)
 
-        score_batch_fn = self._make_score_batch_fn(
-            num_prompt_logprobs, use_tqdm, lora_request
-        )
-        outputs = score_choices_batch(prompt_ids, cand_lists, score_batch_fn, select_by)
+        engine = getattr(self, "llm_engine", None)
+        if (
+            envs.VLLM_ENABLE_NATIVE_CHOICE_SCORING
+            and num_prompt_logprobs == 0
+            and engine is not None
+            and hasattr(engine, "add_request")
+            and hasattr(engine, "step")
+        ):
+            # Engine-resident score: one request per prompt; children are
+            # scored and parsed in-core (no per-candidate IPC).
+            outputs = self._score_native_engine(
+                prompt_ids, cand_lists, select_by, use_tqdm, lora_request
+            )
+        else:
+            score_batch_fn = self._make_score_batch_fn(
+                num_prompt_logprobs, use_tqdm, lora_request
+            )
+            outputs = score_choices_batch(
+                prompt_ids, cand_lists, score_batch_fn, select_by
+            )
         return outputs[0] if single else outputs
 
     def batch_rank(
@@ -313,6 +331,81 @@ class ChoiceScoringOfflineMixin:
             )
             outputs = rank_batch(prompt_ids, cand_lists, ks, score_batch_fn, select_by)
         return outputs[0] if single else outputs
+
+    def _score_native_engine(
+        self,
+        prompt_ids: list[list[int]],
+        cand_lists: list[list[Candidate]],
+        select_by: SelectBy,
+        use_tqdm: bool,
+        lora_request: LoRARequest | None,
+    ) -> list[ScoreChoicesOutput]:
+        """Engine-resident score: one parent request per prompt."""
+        engine = self.llm_engine  # type: ignore[attr-defined]
+        prefix = f"cs-nscore-{random_uuid()}"
+        results: list[ScoreChoicesOutput | None] = [None] * len(prompt_ids)
+        id_to_index: dict[str, int] = {}
+
+        for i, (pids, cands) in enumerate(zip(prompt_ids, cand_lists)):
+            request_id = f"{prefix}-{i}"
+            engine.add_request(
+                request_id,
+                TokensPrompt(prompt_token_ids=list(pids)),
+                make_native_score_params(cands),
+                lora_request=lora_request,
+            )
+            id_to_index[request_id] = i
+
+        pbar = None
+        if use_tqdm and id_to_index:
+            from tqdm.auto import tqdm
+
+            pbar = tqdm(
+                total=len(id_to_index),
+                desc="Scoring (engine-resident)",
+                dynamic_ncols=True,
+                unit="prompt",
+            )
+
+        try:
+            while id_to_index:
+                outputs = engine.step()
+                progressed = False
+                for out in outputs:
+                    if not getattr(out, "finished", False):
+                        continue
+                    i = id_to_index.pop(out.request_id, None)
+                    if i is None:
+                        continue
+                    progressed = True
+                    results[i] = build_score_output(
+                        prompt_ids[i],
+                        cand_lists[i],
+                        getattr(out, "choice_rank_result", None),
+                        select_by,
+                    )
+                    if pbar is not None:
+                        pbar.update(1)
+                if (
+                    not progressed
+                    and id_to_index
+                    and not engine.has_unfinished_requests()
+                ):
+                    raise RuntimeError(
+                        f"engine went idle with {len(id_to_index)} outstanding "
+                        "engine-resident score requests"
+                    )
+        except BaseException:
+            if id_to_index:
+                with contextlib.suppress(Exception):
+                    engine.abort_request(list(id_to_index))
+            raise
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        assert all(r is not None for r in results)
+        return results  # type: ignore[return-value]
 
     def _rank_native_engine(
         self,
