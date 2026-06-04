@@ -22,13 +22,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+import vllm.envs as envs
 from vllm.entrypoints.choice_scoring.core import ScoredContinuation
 from vllm.logprobs import Logprob, PromptLogprobs
+from vllm.sampling_params import SamplingParams
 
 # A callable that runs the generate path over a batch of token-id sequences and
 # returns one object per sequence exposing ``.prompt_token_ids`` and
 # ``.prompt_logprobs`` (i.e. a vLLM ``RequestOutput``). Order must be preserved.
-GenerateFn = Callable[[list[list[int]], int], list["_HasPromptLogprobs"]]
+# Args: (sequences, num_prompt_logprobs, context_lens) -- ``context_lens[i]`` is
+# the length of the shared context prefix of ``sequences[i]`` (everything after
+# it is the candidate), so the backend may restrict prompt-logprob computation
+# to the candidate positions (see ``make_scoring_sampling_params``).
+GenerateFn = Callable[[list[list[int]], int, list[int]], list["_HasPromptLogprobs"]]
 
 
 class _HasPromptLogprobs:
@@ -99,15 +105,44 @@ def extract_continuation_logprobs(
     return logprobs, (ranks if have_all_ranks and len(ranks) == n else None)
 
 
+def make_scoring_sampling_params(
+    num_prompt_logprobs: int = 0,
+    context_len: int | None = None,
+) -> SamplingParams:
+    """Build the teacher-forcing ``SamplingParams`` for one scoring sequence.
+
+    When ``VLLM_ENABLE_NATIVE_CHOICE_SCORING`` is set and ``context_len`` is
+    known, ``prompt_logprobs_from=context_len`` restricts prompt-logprob
+    computation to the candidate positions only -- the LM head then runs over
+    ``len(candidate)`` positions instead of the whole ``context + candidate``
+    sequence. The returned ``prompt_logprobs`` list is ``None``-padded before
+    ``context_len``, which :func:`extract_continuation_logprobs` never reads.
+    """
+    prompt_logprobs_from: int | None = None
+    if (
+        envs.VLLM_ENABLE_NATIVE_CHOICE_SCORING
+        and context_len is not None
+        and context_len > 0
+    ):
+        prompt_logprobs_from = context_len
+    return SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        prompt_logprobs=num_prompt_logprobs,
+        prompt_logprobs_from=prompt_logprobs_from,
+        detokenize=False,
+    )
+
+
 def make_prompt_logprobs_score_batch_fn(
     generate_fn: GenerateFn,
     num_prompt_logprobs: int = 0,
 ):
     """Build a ``ScoreBatchFn`` backed by ``generate_fn`` + ``prompt_logprobs``.
 
-    ``generate_fn(token_id_sequences, num_prompt_logprobs)`` must run the
-    generate path (``max_tokens=1``, ``temperature=0``, ``prompt_logprobs`` set)
-    and return outputs in input order.
+    ``generate_fn(token_id_sequences, num_prompt_logprobs, context_lens)`` must
+    run the generate path (``max_tokens=1``, ``temperature=0``,
+    ``prompt_logprobs`` set) and return outputs in input order.
     """
 
     def _score_batch(
@@ -117,11 +152,10 @@ def make_prompt_logprobs_score_batch_fn(
         context_lens = [len(ctx) for ctx, _ in pairs]
         candidates = [cand for _, cand in pairs]
 
-        outputs = generate_fn(sequences, num_prompt_logprobs)
+        outputs = generate_fn(sequences, num_prompt_logprobs, context_lens)
         if len(outputs) != len(pairs):
             raise ValueError(
-                f"generate_fn returned {len(outputs)} outputs for "
-                f"{len(pairs)} pairs"
+                f"generate_fn returned {len(outputs)} outputs for {len(pairs)} pairs"
             )
 
         return [

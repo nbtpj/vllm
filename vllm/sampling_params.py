@@ -274,6 +274,14 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_logprobs_from: int | None = None
+    """Only compute prompt logprobs for prompt token positions >= this index
+    (the returned ``prompt_logprobs`` list is ``None``-padded before it).
+    Restricting the window avoids running the LM head over every prompt
+    position, which is the dominant cost when teacher-force scoring a short
+    continuation after a long shared context (see choice scoring). ``None``
+    (default) computes logprobs for all prompt positions. Only meaningful
+    when ``prompt_logprobs`` is set."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -563,6 +571,20 @@ class SamplingParams(
                 parameter="prompt_logprobs",
                 value=self.prompt_logprobs,
             )
+        if self.prompt_logprobs_from is not None:
+            if self.prompt_logprobs is None:
+                raise VLLMValidationError(
+                    "prompt_logprobs_from requires prompt_logprobs to be set.",
+                    parameter="prompt_logprobs_from",
+                    value=self.prompt_logprobs_from,
+                )
+            if self.prompt_logprobs_from < 1:
+                raise VLLMValidationError(
+                    f"prompt_logprobs_from must be >= 1 (position 0 never has "
+                    f"a logprob), got {self.prompt_logprobs_from}.",
+                    parameter="prompt_logprobs_from",
+                    value=self.prompt_logprobs_from,
+                )
         assert isinstance(self.stop_token_ids, list)
         if not all(isinstance(st_id, int) for st_id in self.stop_token_ids):
             raise ValueError(

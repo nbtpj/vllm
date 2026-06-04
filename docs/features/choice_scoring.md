@@ -92,6 +92,35 @@ The same operations are exposed over HTTP as `POST /batch_score` and
 
 Scoring runs on the GPU via the engine's logprobs path: each `(context,
 choice)` pair is teacher-forced (`prompt_logprobs`), and the shared prompt KV is
-reused via prefix caching. An optional native single-round-trip backend (gated
-by `VLLM_ENABLE_NATIVE_CHOICE_SCORING`) keeps the whole `batch_rank` loop on the
-worker; it is validated for parity against the logprobs path.
+reused via prefix caching.
+
+### Parallelism
+
+- `batch_score` flattens every `(prompt, choice)` pair across the whole batch
+  into a single fused engine call; the engine continuous-batches all pairs.
+- `batch_rank` is pipelined **per prompt** (no global step barrier):
+    - Offline, a wavefront driver feeds the engine directly
+      (`add_request`/`step`); each prompt's next-step candidates are submitted
+      the moment its own previous step finishes, so a prompt with a small pool
+      never waits for a slower prompt in the same batch.
+    - Online (and any `AsyncLLM` caller), every prompt runs its own async rank
+      loop concurrently; the engine interleaves the in-flight scoring requests.
+- A prompt's rank steps remain sequential by definition: step `t+1` is
+  conditioned on the bundle selected at step `t`.
+
+### Native scoring window (`VLLM_ENABLE_NATIVE_CHOICE_SCORING`)
+
+By default the teacher-forcing path computes prompt logprobs at **every**
+position of `context + choice`, which runs the LM head (a
+`hidden_size x vocab_size` matmul plus a softmax over the vocab) once per
+token of the full sequence. With `VLLM_ENABLE_NATIVE_CHOICE_SCORING=1`,
+`batch_score`/`batch_rank` set `SamplingParams.prompt_logprobs_from` to the
+context length, restricting LM-head computation to the **choice positions
+only** -- for a 1000-token prompt with a 3-token choice that removes ~99% of
+the LM-head work per pair. Outputs are bit-for-bit semantically identical
+(parity-tested against the default path); the flag is off by default until
+you have run the parity tests on your hardware:
+
+```bash
+VLLM_ENABLE_NATIVE_CHOICE_SCORING=1 pytest tests/entrypoints/llm/test_choice_scoring.py -k native_window
+```

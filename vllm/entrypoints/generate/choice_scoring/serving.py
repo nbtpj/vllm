@@ -14,6 +14,7 @@ benefit from automatic prefix caching across a prompt's choices.
 """
 
 import asyncio
+import itertools
 import time
 from collections.abc import AsyncGenerator, Mapping
 
@@ -22,7 +23,7 @@ from pydantic import Field
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.choice_scoring.async_batching import (
-    rank_batch_async,
+    rank_batch_pipelined_async,
     score_choices_batch_async,
 )
 from vllm.entrypoints.choice_scoring.inputs import (
@@ -36,6 +37,7 @@ from vllm.entrypoints.choice_scoring.params import (
 )
 from vllm.entrypoints.choice_scoring.reference import (
     extract_continuation_logprobs,
+    make_scoring_sampling_params,
 )
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.engine.protocol import (
@@ -48,7 +50,6 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
-from vllm.sampling_params import SamplingParams
 from vllm.tracing import (
     contains_trace_headers,
     extract_trace_headers,
@@ -197,24 +198,25 @@ class ServingChoiceScoring(OpenAIServing):
         trace_headers,
         token_counter: list[int],
     ):
-        sampling_params = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            prompt_logprobs=num_prompt_logprobs,
-            detokenize=False,
-        )
+        # Each scoring call gets a distinct id space so concurrent rank
+        # steps (pipelined driver) can never collide on request ids.
+        call_counter = itertools.count()
 
         async def _score_batch(pairs):
+            call_idx = next(call_counter)
             sequences = [list(ctx) + list(cand) for ctx, cand in pairs]
             token_counter[0] += sum(len(s) for s in sequences)
 
             generators: list[AsyncGenerator[RequestOutput, None]] = []
-            for i, seq in enumerate(sequences):
+            for i, ((ctx, _), seq) in enumerate(zip(pairs, sequences)):
+                sampling_params = make_scoring_sampling_params(
+                    num_prompt_logprobs, context_len=len(ctx)
+                )
                 generators.append(
                     self.engine_client.generate(
                         tokens_input(seq),
                         sampling_params,
-                        f"{request_id}-{i}",
+                        f"{request_id}-{call_idx}-{i}",
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         priority=priority,
@@ -347,7 +349,7 @@ class ServingChoiceScoring(OpenAIServing):
         )
 
         try:
-            outputs = await rank_batch_async(
+            outputs = await rank_batch_pipelined_async(
                 [ctx["prompt_ids"]],
                 [ctx["cands"]],
                 [request.k],

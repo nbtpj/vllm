@@ -15,6 +15,7 @@ import pytest
 
 from vllm.entrypoints.choice_scoring.async_batching import (
     rank_batch_async,
+    rank_batch_pipelined_async,
     score_choices_batch_async,
 )
 from vllm.entrypoints.choice_scoring.batching import (
@@ -95,3 +96,96 @@ def test_async_score_result_length_mismatch_raises():
 
     with pytest.raises(ValueError, match="returned 0 results"):
         asyncio.run(score_choices_batch_async([[1]], [[cand([10], 0)]], bad))
+
+
+# --------------------------------------------------------------------------- #
+# rank_batch_pipelined_async
+# --------------------------------------------------------------------------- #
+def test_pipelined_rank_matches_lockstep():
+    pipelined = asyncio.run(
+        rank_batch_pipelined_async(PROMPTS, CHOICES, [3, 2], async_table_fn(TABLE))
+    )
+    lockstep = asyncio.run(
+        rank_batch_async(PROMPTS, CHOICES, [3, 2], async_table_fn(TABLE))
+    )
+    for po, lo in zip(pipelined, lockstep):
+        assert [s.choice_index for s in po.selected] == [
+            s.choice_index for s in lo.selected
+        ]
+        assert [s.token_logprobs for s in po.selected] == [
+            s.token_logprobs for s in lo.selected
+        ]
+        assert po.truncated == lo.truncated
+
+
+def test_pipelined_rank_int_k_and_truncation():
+    out = asyncio.run(
+        rank_batch_pipelined_async(PROMPTS, CHOICES, 5, async_table_fn(TABLE))
+    )
+    # k=5 > pool sizes (3, 2): both truncated, full pools selected.
+    assert [len(o.selected) for o in out] == [3, 2]
+    assert [o.truncated for o in out] == [True, True]
+
+
+def test_pipelined_rank_prompts_advance_independently():
+    """Prompt B must reach its later steps before slow prompt A finishes
+    step 0 -- impossible under the lock-step driver."""
+    events = []
+    blocker: asyncio.Event | None = None
+
+    async def scorer(pairs):
+        nonlocal blocker
+        ctx = pairs[0][0]
+        if list(ctx) == [1]:  # prompt A, step 0: stall until B is done.
+            events.append("A:start")
+            assert blocker is not None
+            await blocker.wait()
+            events.append("A:resume")
+        else:
+            events.append(f"B:step({len(pairs)} pairs)")
+            await asyncio.sleep(0)
+        return [(list(TABLE[tuple(c)]), None) for _ctx, c in pairs]
+
+    async def main():
+        nonlocal blocker
+        blocker = asyncio.Event()
+
+        async def release_when_b_done():
+            # Wait until B has done both steps (2 pairs, then 1 pair).
+            while events.count("B:step(2 pairs)") + events.count("B:step(1 pairs)") < 2:
+                await asyncio.sleep(0)
+            blocker.set()
+
+        releaser = asyncio.ensure_future(release_when_b_done())
+        out = await rank_batch_pipelined_async(
+            [[1], [2]],
+            CHOICES,
+            [1, 2],
+            scorer,
+        )
+        await releaser
+        return out
+
+    out = asyncio.run(main())
+    # B finished both its steps while A was stalled on step 0.
+    assert events.index("A:resume") > events.index("B:step(1 pairs)")
+    assert [s.choice_index for s in out[1].selected] == [0, 1]
+
+
+def test_pipelined_rank_error_cancels_and_raises():
+    async def scorer(pairs):
+        ctx = pairs[0][0]
+        if list(ctx) == [1]:
+            raise RuntimeError("backend exploded")
+        await asyncio.sleep(0)
+        return [(list(TABLE[tuple(c)]), None) for _ctx, c in pairs]
+
+    with pytest.raises(RuntimeError, match="backend exploded"):
+        asyncio.run(rank_batch_pipelined_async(PROMPTS, CHOICES, [3, 2], scorer))
+
+
+def test_pipelined_rank_k_length_mismatch_raises():
+    with pytest.raises(ValueError, match="expected 2 k values"):
+        asyncio.run(
+            rank_batch_pipelined_async(PROMPTS, CHOICES, [1], async_table_fn(TABLE))
+        )

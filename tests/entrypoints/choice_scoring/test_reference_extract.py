@@ -119,8 +119,9 @@ class FakeOut:
 
 def test_score_batch_fn_extracts_per_pair():
     # Two pairs: (ctx=[1], cand=[50]) and (ctx=[1,2], cand=[60,61]).
-    def fake_generate(sequences, num_prompt_logprobs):
+    def fake_generate(sequences, num_prompt_logprobs, context_lens):
         assert num_prompt_logprobs == 0
+        assert context_lens == [1, 2]
         # Build per-sequence prompt_logprobs covering the candidate tail.
         assert sequences[0] == [1, 50]
         assert sequences[1] == [1, 2, 60, 61]
@@ -140,7 +141,7 @@ def test_score_batch_fn_extracts_per_pair():
 
 
 def test_score_batch_fn_output_length_mismatch_raises():
-    def bad_generate(sequences, num_prompt_logprobs):
+    def bad_generate(sequences, num_prompt_logprobs, context_lens):
         return []
 
     fn = make_prompt_logprobs_score_batch_fn(bad_generate)

@@ -1,5 +1,18 @@
 # Native (L3) choice-scoring & ranking — engine wiring blueprint
 
+> **Status update.** Option (a) below is **implemented**: the
+> `SamplingParams.prompt_logprobs_from` window (gated by
+> `VLLM_ENABLE_NATIVE_CHOICE_SCORING`) restricts LM-head computation to the
+> candidate positions in both V1 (`gpu_model_runner._get_prompt_logprobs_dict`)
+> and V2 (`gpu/sample/prompt_logprob.PromptLogprobsWorker`) model runners, with
+> `None`-padding in the output processor and GPU parity tests
+> (`tests/entrypoints/llm/test_choice_scoring.py -k native_window`).
+> Cross-prompt pipelining is also implemented: `wavefront.rank_batch_wavefront`
+> (offline, engine `add_request`/`step`) and
+> `async_batching.rank_batch_pipelined_async` (async/serving) remove the
+> global rank step barrier. Option (b) — the resident single-request loop with
+> on-device selection via `native_tensor_ops` — remains future work.
+
 This document specifies the remaining **GPU-only** work to make `score` and
 `rank` execute natively inside the V1 worker (single round-trip, on-device
 selection), instead of the reference `prompt_logprobs` orchestration. The

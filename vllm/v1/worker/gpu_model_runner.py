@@ -5342,9 +5342,7 @@ class GPUModelRunner(
             from safetensors.torch import load as _safetensors_load
 
             if weights_iterator is not None:
-                raise ValueError(
-                    "pass at most one of weights_iterator / weights_bytes"
-                )
+                raise ValueError("pass at most one of weights_iterator / weights_bytes")
             weights_iterator = list(_safetensors_load(weights_bytes).items())
 
         # TODO(@kylesayrs): generalize to all runners and loaders
@@ -5458,13 +5456,24 @@ class GPUModelRunner(
                 self.device, non_blocking=True
             )
 
+            # Optional window: only produce logprobs for prompt token
+            # positions >= prompt_logprobs_from. Row r of the result holds
+            # the logprob of prompt token r+1, so the first wanted row is
+            # prompt_logprobs_from - 1. Rows below the window are neither
+            # allocated nor computed (the LM head is the dominant cost).
+            sp = request.sampling_params
+            from_row = 0
+            if sp is not None and sp.prompt_logprobs_from is not None:
+                from_row = min(sp.prompt_logprobs_from - 1, num_prompt_tokens - 1)
+
             # Set up target LogprobsTensors object.
             logprobs_tensors = request.in_progress_prompt_logprobs_cpu
             if logprobs_tensors is None:
-                # Create empty logprobs CPU tensors for the entire prompt.
+                # Create empty logprobs CPU tensors for the windowed prompt
+                # suffix (the entire prompt when no window is set).
                 # If chunked, we'll copy in slice by slice.
                 logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
+                    num_prompt_tokens - 1 - from_row, num_prompt_logprobs + 1
                 )
                 request.in_progress_prompt_logprobs_cpu = logprobs_tensors
 
@@ -5490,18 +5499,28 @@ class GPUModelRunner(
                 # step. There are no more prompt logprobs to produce.
                 continue
 
+            # Clamp this chunk's rows [start_idx, start_idx + num_logits) to
+            # the window.
+            lo = max(start_idx, from_row)
+            hi = start_idx + num_logits
+            if lo >= hi:
+                # The whole chunk is below the window; nothing to compute.
+                continue
+
             # Get the logits corresponding to this req's prompt tokens.
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            prompt_hidden_states = hidden_states[
+                offset + (lo - start_idx) : offset + (hi - start_idx)
+            ]
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
             # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            tgt_token_ids = prompt_token_ids[lo + 1 : hi + 1]
 
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
@@ -5509,8 +5528,8 @@ class GPUModelRunner(
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
 
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
+            # Transfer GPU->CPU async (row indices are window-relative).
+            chunk_slice = slice(lo - from_row, hi - from_row)
             logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
                 token_ids, non_blocking=True
             )

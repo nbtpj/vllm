@@ -49,6 +49,16 @@ class LogprobsProcessor:
         assert sampling_params is not None
         num_logprobs = sampling_params.num_logprobs
         num_prompt_logprobs = sampling_params.prompt_logprobs
+        prompt_logprobs = None
+        if num_prompt_logprobs is not None:
+            prompt_logprobs = create_prompt_logprobs(sampling_params.flat_logprobs)
+            # With a prompt-logprobs window, positions before
+            # prompt_logprobs_from are not computed; pad them with None so
+            # received rows land at their absolute prompt positions.
+            # (create_prompt_logprobs already holds the position-0 None.)
+            if sampling_params.prompt_logprobs_from is not None:
+                for _ in range(sampling_params.prompt_logprobs_from - 1):
+                    prompt_logprobs.append(None)
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.0),
@@ -57,11 +67,7 @@ class LogprobsProcessor:
                 if num_logprobs is None
                 else create_sample_logprobs(sampling_params.flat_logprobs)
             ),
-            prompt_logprobs=(
-                None
-                if num_prompt_logprobs is None
-                else create_prompt_logprobs(sampling_params.flat_logprobs)
-            ),
+            prompt_logprobs=prompt_logprobs,
             num_prompt_logprobs=num_prompt_logprobs,
             num_logprobs=num_logprobs,
         )

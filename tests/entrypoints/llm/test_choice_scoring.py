@@ -155,9 +155,7 @@ def test_rank_k1_matches_score_best(llm: LLM):
 def test_rank_deterministic(llm: LLM):
     a = llm.batch_rank(PROMPT, CHOICES, k=len(CHOICES))
     b = llm.batch_rank(PROMPT, CHOICES, k=len(CHOICES))
-    assert [s.choice_index for s in a.selected] == [
-        s.choice_index for s in b.selected
-    ]
+    assert [s.choice_index for s in a.selected] == [s.choice_index for s in b.selected]
 
 
 @pytest.mark.skip_global_cleanup
@@ -178,3 +176,60 @@ def test_rank_batch_per_prompt_k(llm: LLM):
     assert len(outs) == 2
     assert len(outs[0].selected) == 2
     assert len(outs[1].selected) == 1
+
+
+# --------------------------------------------------------------------------- #
+# native window parity (VLLM_ENABLE_NATIVE_CHOICE_SCORING)
+# --------------------------------------------------------------------------- #
+# The reference path computes prompt logprobs at every position; the native
+# window restricts the LM head to the candidate positions. Same inputs must
+# give the same outputs within fp tolerance -- the reference is the oracle.
+@pytest.mark.skip_global_cleanup
+def test_native_window_score_parity(llm: LLM, monkeypatch):
+    monkeypatch.delenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", raising=False)
+    base = llm.batch_score(PROMPT, CHOICES)
+    monkeypatch.setenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", "1")
+    native = llm.batch_score(PROMPT, CHOICES)
+    assert native.best_choice_index == base.best_choice_index
+    for cb, cn in zip(base.choices, native.choices):
+        assert cn.token_ids == cb.token_ids
+        assert cn.token_logprobs == pytest.approx(cb.token_logprobs, abs=1e-3)
+        assert cn.is_greedy == cb.is_greedy
+
+
+@pytest.mark.skip_global_cleanup
+def test_native_window_score_parity_with_topk(llm: LLM, monkeypatch):
+    monkeypatch.delenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", raising=False)
+    base = llm.batch_score(PROMPT, CHOICES, num_prompt_logprobs=5)
+    monkeypatch.setenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", "1")
+    native = llm.batch_score(PROMPT, CHOICES, num_prompt_logprobs=5)
+    for cb, cn in zip(base.choices, native.choices):
+        assert cn.token_logprobs == pytest.approx(cb.token_logprobs, abs=1e-3)
+
+
+@pytest.mark.skip_global_cleanup
+def test_native_window_rank_parity(llm: LLM, monkeypatch):
+    monkeypatch.delenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", raising=False)
+    base = llm.batch_rank(PROMPT, CHOICES, k=len(CHOICES))
+    monkeypatch.setenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", "1")
+    native = llm.batch_rank(PROMPT, CHOICES, k=len(CHOICES))
+    assert [s.choice_index for s in native.selected] == [
+        s.choice_index for s in base.selected
+    ]
+    assert native.truncated == base.truncated
+    for sb, sn in zip(base.selected, native.selected):
+        assert sn.token_logprobs == pytest.approx(sb.token_logprobs, abs=1e-3)
+
+
+@pytest.mark.skip_global_cleanup
+def test_native_window_batch_parity(llm: LLM, monkeypatch):
+    prompts = ["The capital of France is", "Two plus two equals"]
+    choices = [[" Paris", " London"], [" four", " five", " purple"]]
+    monkeypatch.delenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", raising=False)
+    base = llm.batch_score(prompts, choices)
+    monkeypatch.setenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", "1")
+    native = llm.batch_score(prompts, choices)
+    for ob, on in zip(base, native):
+        assert on.best_choice_index == ob.best_choice_index
+        for cb, cn in zip(ob.choices, on.choices):
+            assert cn.token_logprobs == pytest.approx(cb.token_logprobs, abs=1e-3)
