@@ -117,9 +117,19 @@ token of the full sequence. With `VLLM_ENABLE_NATIVE_CHOICE_SCORING=1`,
 `batch_score`/`batch_rank` set `SamplingParams.prompt_logprobs_from` to the
 context length, restricting LM-head computation to the **choice positions
 only** -- for a 1000-token prompt with a 3-token choice that removes ~99% of
-the LM-head work per pair. Outputs are bit-for-bit semantically identical
-(parity-tested against the default path); the flag is off by default until
-you have run the parity tests on your hardware:
+the LM-head work per pair.
+
+The window also re-enables **prefix-cache reads**: plain `prompt_logprobs`
+requests must skip reading cached prefix (cached positions produce no
+logits), so by default every `(context, choice)` pair re-prefills its whole
+context. With the window, the KV cache manager caps the cache hit just below
+the window start, so the shared context KV is genuinely reused across a
+prompt's choices and across rank steps.
+
+Outputs are semantically identical (parity-tested against the default path;
+small fp deviations are possible in low-precision dtypes because the LM head
+runs over a different batch shape). The flag is off by default until you have
+run the parity tests on your hardware:
 
 ```bash
 VLLM_ENABLE_NATIVE_CHOICE_SCORING=1 pytest tests/entrypoints/llm/test_choice_scoring.py -k native_window

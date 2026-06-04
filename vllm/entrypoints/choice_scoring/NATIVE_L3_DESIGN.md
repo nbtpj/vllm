@@ -6,7 +6,10 @@
 > candidate positions in both V1 (`gpu_model_runner._get_prompt_logprobs_dict`)
 > and V2 (`gpu/sample/prompt_logprob.PromptLogprobsWorker`) model runners, with
 > `None`-padding in the output processor and GPU parity tests
-> (`tests/entrypoints/llm/test_choice_scoring.py -k native_window`).
+> (`tests/entrypoints/llm/test_choice_scoring.py -k native_window`). The
+> window also re-enables prefix-cache reads for scoring requests (hit capped
+> below the window start in the KV cache manager), so shared-context KV is
+> actually reused across choices and rank steps.
 > Cross-prompt pipelining is also implemented: `wavefront.rank_batch_wavefront`
 > (offline, engine `add_request`/`step`) and
 > `async_batching.rank_batch_pipelined_async` (async/serving) remove the
