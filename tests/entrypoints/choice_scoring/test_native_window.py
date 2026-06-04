@@ -43,6 +43,30 @@ def test_prompt_logprobs_from_valid():
 
 
 # --------------------------------------------------------------------------- #
+# prefix-cache reading
+# --------------------------------------------------------------------------- #
+def test_prompt_logprobs_skips_prefix_cache_read():
+    # Without a window, every position needs a logit -> cached prefix would
+    # produce no logits, so reading must be skipped (existing behavior).
+    sp = SamplingParams(prompt_logprobs=0)
+    assert sp.skip_reading_prefix_cache is True
+
+
+def test_window_reenables_prefix_cache_read():
+    # With a window, positions below it need no logprobs, so cached prefix
+    # may be reused (the KV cache manager caps the hit below the window).
+    sp = SamplingParams(prompt_logprobs=0, prompt_logprobs_from=4)
+    assert sp.skip_reading_prefix_cache is False
+
+
+def test_explicit_skip_reading_prefix_cache_preserved():
+    sp = SamplingParams(
+        prompt_logprobs=0, prompt_logprobs_from=4, skip_reading_prefix_cache=True
+    )
+    assert sp.skip_reading_prefix_cache is True
+
+
+# --------------------------------------------------------------------------- #
 # make_scoring_sampling_params x VLLM_ENABLE_NATIVE_CHOICE_SCORING
 # --------------------------------------------------------------------------- #
 def test_scoring_params_default_no_window(monkeypatch):

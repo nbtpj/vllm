@@ -489,7 +489,13 @@ class SamplingParams(
             # If prefix caching is enabled,
             # the output of prompt logprobs may less than n_prompt_tokens,
             # we need to skip reading cache at this request.
-            self.skip_reading_prefix_cache = self.prompt_logprobs is not None
+            # Exception: with a prompt_logprobs_from window, positions below
+            # the window need no logprobs, so cached prefix may be reused as
+            # long as the hit stays below the window start (the KV cache
+            # manager caps the hit length accordingly).
+            self.skip_reading_prefix_cache = (
+                self.prompt_logprobs is not None and self.prompt_logprobs_from is None
+            )
 
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):

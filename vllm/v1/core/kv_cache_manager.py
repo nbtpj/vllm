@@ -219,6 +219,19 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+
+        # A request with a prompt-logprobs window must recompute every
+        # position from the window start onward (cached positions produce no
+        # logits), so cap the cache hit below the window.
+        sampling_params = request.sampling_params
+        if (
+            sampling_params is not None
+            and sampling_params.prompt_logprobs is not None
+            and sampling_params.prompt_logprobs_from is not None
+        ):
+            max_cache_hit_length = min(
+                max_cache_hit_length, sampling_params.prompt_logprobs_from - 1
+            )
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
