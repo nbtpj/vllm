@@ -121,6 +121,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        choice_rank_result: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,6 +142,9 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        # Result of an engine-resident choice-rank request (see
+        # vllm/v1/engine/choice_rank.py); None for ordinary requests.
+        self.choice_rank_result = choice_rank_result
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""

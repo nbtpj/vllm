@@ -67,6 +67,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.choice_rank import ChoiceRankCoordinator
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -218,6 +219,9 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        # Engine-resident choice ranking (see vllm/v1/engine/choice_rank.py).
+        self.choice_rank_coordinator = ChoiceRankCoordinator(self)
+
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
@@ -365,6 +369,11 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        # Engine-resident choice ranking: the parent request is never
+        # scheduled; the coordinator drives child scoring requests instead.
+        if self.choice_rank_coordinator.try_intercept(request):
+            return
+
         self.scheduler.add_request(request)
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs
@@ -373,6 +382,10 @@ class EngineCore:
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
+
+        # Tear down any engine-resident rank groups (and their children)
+        # whose parent is being aborted.
+        self.choice_rank_coordinator.handle_aborts(request_ids)
 
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
@@ -446,6 +459,10 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            if self.choice_rank_coordinator.has_ready_outputs:
+                # Flush parent results that became ready without any
+                # scheduler work (e.g. rejected payloads).
+                return self.choice_rank_coordinator.process_outputs({}), False
             return {}, False
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
@@ -463,6 +480,9 @@ class EngineCore:
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        engine_core_outputs = self.choice_rank_coordinator.process_outputs(
+            engine_core_outputs
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -542,6 +562,10 @@ class EngineCore:
                     return None, model_executed
 
         elif not batch_queue:
+            if self.choice_rank_coordinator.has_ready_outputs:
+                # Flush parent results that became ready without any
+                # scheduler work (e.g. rejected payloads).
+                return self.choice_rank_coordinator.process_outputs({}), False
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
@@ -565,6 +589,9 @@ class EngineCore:
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        engine_core_outputs = self.choice_rank_coordinator.process_outputs(
+            engine_core_outputs
         )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -1203,6 +1230,7 @@ class EngineCoreProc(EngineCore):
             self.engines_running
             or self.scheduler.has_requests()
             or bool(self.batch_queue)
+            or self.choice_rank_coordinator.has_ready_outputs
         )
 
     def is_running(self) -> bool:

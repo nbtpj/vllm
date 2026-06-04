@@ -37,6 +37,10 @@ from vllm.entrypoints.choice_scoring.inputs import (
     normalize_prompt,
     validate_lengths,
 )
+from vllm.entrypoints.choice_scoring.native import (
+    build_rank_output,
+    make_native_rank_params,
+)
 from vllm.entrypoints.choice_scoring.params import (
     RankOutput,
     ScoreChoicesOutput,
@@ -401,6 +405,23 @@ class ServingChoiceScoring(OpenAIServing):
         base_id = self._base_request_id(raw_request, default=request.request_id)
         request_id = f"batch-rank-{base_id}"
         token_counter = [0]
+
+        if envs.VLLM_ENABLE_NATIVE_CHOICE_SCORING and request.k > 0:
+            # Engine-resident rank: one request carries the whole pool; the
+            # engine runs the entire k-step selection loop internally.
+            try:
+                output = await self._rank_native_engine(request, ctx, request_id)
+            except asyncio.CancelledError:
+                return self.create_error_response("Client disconnected")
+            except (ValueError, RuntimeError) as e:
+                return self.create_error_response(str(e))
+            token_counter[0] = len(ctx["prompt_ids"]) + sum(
+                len(c.token_ids) for c in ctx["cands"]
+            )
+            return self._build_rank_response(
+                output, request, ctx["lora_request"], request_id, token_counter[0]
+            )
+
         score_fn = self._make_async_score_batch_fn(
             request_id,
             request.num_prompt_logprobs,
@@ -425,6 +446,27 @@ class ServingChoiceScoring(OpenAIServing):
 
         return self._build_rank_response(
             outputs[0], request, ctx["lora_request"], request_id, token_counter[0]
+        )
+
+    async def _rank_native_engine(self, request, ctx, request_id: str):
+        """Run one engine-resident rank request and build its RankOutput."""
+        params = make_native_rank_params(ctx["cands"], request.k, request.select_by)
+        final = None
+        async for res in self.engine_client.generate(
+            tokens_input(list(ctx["prompt_ids"])),
+            params,
+            request_id,
+            lora_request=ctx["lora_request"],
+            trace_headers=ctx["trace_headers"],
+            priority=request.priority,
+        ):
+            final = res
+        if final is None:
+            raise RuntimeError("no output for engine-resident rank request")
+        return build_rank_output(
+            ctx["prompt_ids"],
+            ctx["cands"],
+            getattr(final, "choice_rank_result", None),
         )
 
     def _build_score_response(

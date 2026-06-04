@@ -195,6 +195,10 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
+    # Result of an engine-resident choice-rank request
+    # (see vllm/v1/engine/choice_rank.py).
+    choice_rank_result: dict[str, Any] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

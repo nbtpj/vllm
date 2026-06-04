@@ -126,7 +126,17 @@ context. With the window, the KV cache manager caps the cache hit just below
 the window start, so the shared context KV is genuinely reused across a
 prompt's choices and across rank steps.
 
-The flag enables two further request-level optimizations:
+With the flag on, `batch_rank` becomes **engine-resident** (general, any
+bundle lengths): the client sends ONE request per prompt carrying the whole
+candidate pool; the `EngineCore` intercepts it and runs the entire k-step
+selection loop internally -- child scoring sequences share the context KV via
+the prefix cache, their windowed logprob tensors are consumed and the best
+bundle selected *in-core* (identical semantics to the client-side drivers,
+parity-tested), and only the final structured result crosses the IPC
+boundary. This removes per-candidate output serialization, client-side
+logprob pythonization, and per-step submission round trips.
+
+The flag enables two further request-level optimizations for `batch_score`:
 
 - **Single-token fast path** -- when *all* of a prompt's choices are single
   tokens (the classic A/B/C/D case), no teacher forcing is needed: one

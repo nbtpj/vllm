@@ -13,8 +13,16 @@
 > Cross-prompt pipelining is also implemented: `wavefront.rank_batch_wavefront`
 > (offline, engine `add_request`/`step`) and
 > `async_batching.rank_batch_pipelined_async` (async/serving) remove the
-> global rank step barrier. Option (b) — the resident single-request loop with
-> on-device selection via `native_tensor_ops` — remains future work.
+> global rank step barrier.
+>
+> **Option (b) is implemented** in its multi-sequence form:
+> `vllm/v1/engine/choice_rank.py` runs the whole rank loop inside the
+> EngineCore (one parent request per prompt via
+> `SamplingParams.extra_args["choice_rank"]`; children = windowed scoring
+> sequences sharing prefix-cached KV; in-core selection on the raw logprob
+> tensors; single structured result over IPC). The remaining future work is
+> the single-forward packed-pool variant, which requires per-request
+> branch/tree attention masks that no V1 backend currently exposes.
 
 This document specifies the remaining **GPU-only** work to make `score` and
 `rank` execute natively inside the V1 worker (single round-trip, on-device
