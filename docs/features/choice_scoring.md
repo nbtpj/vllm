@@ -146,6 +146,13 @@ to 16 candidates; the packed suffix never enters the prefix cache. Huge
 single-token pools (e.g. 30k variable candidates) shard automatically into
 128-id `logprob_token_ids` children regardless of this flag.
 
+!!! note "Measured guidance"
+    Packed mode is parity-exact (fp32/bf16/4-bit verified) but
+    throughput-neutral at small pools (~4 candidates): the per-step block-
+    mask rebuild offsets the scheduler-request savings. Leave it off unless
+    pools are large (it sustains ~2k scored candidates/s on 30k-candidate
+    pools, where 16-candidate packs amortize the mask cost).
+
 The flag enables two further request-level optimizations for `batch_score`:
 
 - **Single-token fast path** -- when *all* of a prompt's choices are single
