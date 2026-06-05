@@ -18,11 +18,47 @@
 > **Option (b) is implemented** in its multi-sequence form:
 > `vllm/v1/engine/choice_rank.py` runs the whole rank loop inside the
 > EngineCore (one parent request per prompt via
-> `SamplingParams.extra_args["choice_rank"]`; children = windowed scoring
-> sequences sharing prefix-cached KV; in-core selection on the raw logprob
-> tensors; single structured result over IPC). The remaining future work is
-> the single-forward packed-pool variant, which requires per-request
-> branch/tree attention masks that no V1 backend currently exposes.
+> `SamplingParams.extra_args["choice_rank"]` / `["choice_score"]`; children =
+> windowed scoring sequences sharing prefix-cached KV, fused
+> `logprob_token_ids` steps for single-token pools, decode-fused runs via
+> `ShrinkingAllowedTokenIdsLogitsProcessor` for unique single-token pools;
+> in-core selection on the raw logprob tensors; single structured result
+> over IPC).
+
+## Stage 2 blueprint: packed-pool single-forward scoring
+
+The remaining multi-x for general bundles: score ALL candidates of one
+prompt-step in ONE child sequence ``ctx + cand_0 + ... + cand_{N-1}``.
+Four pieces, all GPU-validated against the multi-sequence path as oracle:
+
+1. **Branch attention mask** (FlexAttention only; other backends keep the
+   multi-sequence path). The in-tree backend already composes
+   ``mask_mod``s; add a per-request branch layout (candidate ``[start,
+   end)`` spans in sequence coordinates) so ``kv_idx`` from another
+   candidate's span is masked. Layout must reach the metadata builder --
+   runner-side side-table keyed by request, populated from
+   ``SamplingParams`` (the packed child is engine-fabricated).
+2. **Positions override**: packed candidate tokens need logical positions
+   ``ctx_len + offset_within_candidate`` (reset per candidate), not the
+   linear sequence positions the runner builds from
+   ``num_computed_tokens`` -- rotary embeddings must see the logical
+   position. Per-request positions patch in input preparation.
+3. **Targeted logprob gather** replaces the suffix window: the first token
+   of EVERY candidate is predicted by the same row (``ctx_len - 1``), so
+   extraction needs multi-id gather at that row plus per-candidate rows
+   ``start_j .. start_j + L_j - 2`` for the rest (boundary rows between
+   candidates are garbage by construction and skipped). This is exactly
+   `native_tensor_ops.score_candidates` fed by a per-request (row, ids)
+   spec -- the design's original §1 ``ChoiceScoringParams``.
+4. **Cache cap**: the packed child caps prefix-cache reads below
+   ``ctx_len`` (reuse the ``prompt_logprobs_from`` capping path) and must
+   NOT write its packed suffix to the prefix cache (candidate KV under a
+   branch mask is not valid causal KV for other requests) -- mark the
+   suffix blocks uncacheable.
+
+Constraint: chunked prefill may split the packed sequence at any boundary;
+the flex ``mask_mod`` works on absolute coordinates so the layout-based
+mask remains correct across chunks.
 
 This document specifies the remaining **GPU-only** work to make `score` and
 `rank` execute natively inside the V1 worker (single round-trip, on-device

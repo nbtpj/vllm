@@ -248,7 +248,10 @@ class ChoiceRankCoordinator:
         #   all remaining steps (greedy decoding over a shrinking allowed
         #   set -- the rank loop becomes ordinary decode steps on the
         #   CUDA-graph path). Gated off under speculative decoding (the
-        #   masking processor has no draft-row support).
+        #   masking processor has no draft-row support) and under async
+        #   scheduling (the previous step's sampled token is not yet in
+        #   output_tok_ids when the next step's logits are masked, so
+        #   without-replacement cannot be enforced).
         # - fast step: otherwise, when all remaining are single tokens, one
         #   request with logprob_token_ids scores the pool in one forward.
         ids = [c[0] for _, c in group.remaining]
@@ -261,6 +264,7 @@ class ChoiceRankCoordinator:
             and steps_left >= 2
             and len(set(ids)) == len(ids)
             and self.core.vllm_config.speculative_config is None
+            and not self.core.vllm_config.scheduler_config.async_scheduling
         ):
             self._spawn_decode_run(group, ids, steps_left)
             return

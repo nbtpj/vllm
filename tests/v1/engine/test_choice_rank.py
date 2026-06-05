@@ -39,12 +39,15 @@ class FakeScheduler:
 
 
 class FakeCore:
-    def __init__(self, speculative_config=None):
+    def __init__(self, speculative_config=None, async_scheduling=False):
         from types import SimpleNamespace
 
         self.scheduler = FakeScheduler()
         self.request_block_hasher = None
-        self.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        self.vllm_config = SimpleNamespace(
+            speculative_config=speculative_config,
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        )
 
 
 # Per-token logprob assigned to each token id by the fake model.
@@ -475,3 +478,18 @@ def test_score_mode_single_token_fast_step():
     assert [c["token_logprobs"][0] for c in choices] == [-3.0, -1.0, -2.0]
     # Exact greedy info: token 11 is the argmax of the pool.
     assert [c["ranks"][0] for c in choices] == [2, 1, 2]
+
+
+def test_async_scheduling_disables_decode_run():
+    core = FakeCore(async_scheduling=True)
+    coord = ChoiceRankCoordinator(core)
+    coord.try_intercept(make_parent([1], [[10], [11], [12]], k=3))
+    # Falls back to per-step fast steps: without-replacement masking cannot
+    # see the previous step's sampled token under async scheduling.
+    child = core.scheduler.queue[0]
+    assert child.sampling_params.extra_args is None
+    assert child.sampling_params.logprob_token_ids == [10, 11, 12]
+    outs = drive(core, coord)
+    orders = [s["choice_index"] for s in outs[0].choice_rank_result["selected"]]
+    ref_orders, _ = reference_orders([1], [[10], [11], [12]], 3)
+    assert orders == ref_orders
