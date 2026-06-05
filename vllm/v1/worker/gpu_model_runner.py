@@ -633,6 +633,12 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        # Packed choice-scoring layouts (engine-resident coordinator):
+        # req_id -> (context_len, [(start, end), ...]) in packed coordinates.
+        self.packed_choice_layouts: dict[str, tuple[int, list[tuple[int, int]]]] = {}
+        # Pending anchor fix-ups for packed requests (see
+        # _stash_packed_anchor): req_id -> (slots, ids, logprobs, ranks).
+        self._packed_anchor_fixes: dict[str, tuple] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1132,6 +1138,8 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.packed_choice_layouts.pop(req_id, None)
+            self._packed_anchor_fixes.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1238,6 +1246,14 @@ class GPUModelRunner(
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
+
+            if sampling_params and sampling_params.extra_args:
+                layout = sampling_params.extra_args.get("packed_choice_layout")
+                if layout is not None:
+                    self.packed_choice_layouts[req_id] = (
+                        int(layout["context_len"]),
+                        [(int(s), int(e)) for s, e in layout["spans"]],
+                    )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
@@ -2101,6 +2117,12 @@ class GPUModelRunner(
             self.positions[:total_num_scheduled_tokens],
         )
 
+        if self.packed_choice_layouts:
+            # Packed choice scoring: rotary positions must be LOGICAL
+            # (context_len + offset within candidate), while everything
+            # above (token gather, slot mapping) used packed coordinates.
+            self._override_packed_positions(num_reqs, cu_num_tokens)
+
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
@@ -2449,6 +2471,9 @@ class GPUModelRunner(
 
                 else:
                     _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+
+        if self.packed_choice_layouts:
+            self._set_choice_branch_spans_for_metadata(attn_metadata)
 
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
@@ -5524,6 +5549,17 @@ class GPUModelRunner(
 
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
+
+            # Packed choice scoring: the chunk containing the anchor row
+            # (context_len - 1) is the only one holding the logits that
+            # predict every candidate's FIRST token; gather them now and
+            # patch the boundary slots once the request completes.
+            packed_layout = self.packed_choice_layouts.get(req_id)
+            if packed_layout is not None and lo <= from_row < hi:
+                self._stash_packed_anchor(
+                    req_id, packed_layout, logprobs[from_row - lo]
+                )
+
             token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
@@ -5547,8 +5583,49 @@ class GPUModelRunner(
         # Must synchronize the non-blocking GPU->CPU transfers.
         if prompt_logprobs_dict:
             self._sync_device()
+            for req_id, tensors in prompt_logprobs_dict.items():
+                fix = self._packed_anchor_fixes.pop(req_id, None)
+                if fix is None or tensors is None:
+                    continue
+                slots, fix_ids, fix_lps, fix_ranks = fix
+                for j, slot in enumerate(slots):
+                    tensors.logprob_token_ids[slot, 0] = fix_ids[j]
+                    tensors.logprobs[slot, 0] = fix_lps[j]
+                    tensors.selected_token_ranks[slot] = fix_ranks[j]
 
         return prompt_logprobs_dict
+
+    def _stash_packed_anchor(
+        self,
+        req_id: str,
+        layout: tuple[int, list[tuple[int, int]]],
+        anchor_row: torch.Tensor,
+    ) -> None:
+        """Gather first-token logprobs of candidates 1..N-1 from the anchor
+        row's full distribution (candidate 0's boundary slot is already
+        correct: its first token IS the packed next-token at the anchor)."""
+        context_len, spans = layout
+        request = self.requests[req_id]
+        prompt = request.prompt_token_ids
+        assert prompt is not None
+        tail_spans = spans[1:]
+        if not tail_spans:
+            return
+        first_ids = torch.tensor(
+            [prompt[start] for start, _ in tail_spans],
+            dtype=torch.int64,
+            device=anchor_row.device,
+        )
+        first_lps = anchor_row[first_ids]
+        first_ranks = (
+            (anchor_row.unsqueeze(0) > first_lps.unsqueeze(1)).sum(-1) + 1
+        ).to(torch.int32)
+        self._packed_anchor_fixes[req_id] = (
+            [start - context_len for start, _ in tail_spans],
+            first_ids.to("cpu", non_blocking=True),
+            first_lps.to("cpu", non_blocking=True),
+            first_ranks.to("cpu", non_blocking=True),
+        )
 
     def _get_nans_in_logits(
         self,
@@ -6936,6 +7013,73 @@ class GPUModelRunner(
             self.reorder_batch_threshold = None
             return
         self.reorder_batch_threshold = reduce(min_none_high, reorder_batch_thresholds)  # type: ignore[assignment]
+
+    def _override_packed_positions(
+        self, num_reqs: int, cu_num_tokens: np.ndarray
+    ) -> None:
+        """Rewrite GPU positions of packed choice-scoring requests.
+
+        A packed sequence is ``ctx + cand_0 + ... + cand_{N-1}``; the rotary
+        position of a candidate token is ``ctx_len + offset_within_candidate``
+        (each candidate restarts right after the context). Must run AFTER
+        compute_slot_mapping (which needs packed positions).
+        """
+        req_ids = self.input_batch.req_ids
+        for i in range(num_reqs):
+            layout = self.packed_choice_layouts.get(req_ids[i])
+            if layout is None:
+                continue
+            context_len, spans = layout
+            row_start = int(cu_num_tokens[i - 1]) if i > 0 else 0
+            row_end = int(cu_num_tokens[i])
+            n = row_end - row_start
+            if n <= 0:
+                continue
+            base = int(self.input_batch.num_computed_tokens_cpu[i])
+            packed_pos = base + np.arange(n, dtype=np.int64)
+            starts = np.array([span[0] for span in spans], dtype=np.int64)
+            span_idx = np.searchsorted(starts, packed_pos, side="right") - 1
+            in_suffix = packed_pos >= context_len
+            span_start = starts[np.clip(span_idx, 0, None)]
+            logical = np.where(
+                in_suffix, context_len + (packed_pos - span_start), packed_pos
+            )
+            self.positions[row_start:row_end] = torch.from_numpy(logical).to(
+                self.positions.device, non_blocking=True
+            )
+
+    def _set_choice_branch_spans_for_metadata(self, attn_metadata: dict) -> None:
+        """Stamp packed choice-scoring layouts onto FlexAttention metadata.
+
+        Mirrors ``_set_mm_prefix_range_for_metadata``. Raises if a packed
+        request is scheduled on a backend without branch-mask support
+        (silently wrong logprobs otherwise).
+        """
+        req_spans: dict[int, tuple[int, list[tuple[int, int]]]] = {}
+        for req_id, layout in self.packed_choice_layouts.items():
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is not None:
+                req_spans[req_idx] = layout
+        if not req_spans:
+            return
+
+        seen_metadata_ids: set[int] = set()
+        supported = False
+        for metadata in attn_metadata.values():
+            if id(metadata) in seen_metadata_ids:
+                continue
+            seen_metadata_ids.add(id(metadata))
+            if hasattr(type(metadata), "choice_branch_spans") or hasattr(
+                metadata, "choice_branch_spans"
+            ):
+                metadata.choice_branch_spans = req_spans
+                supported = True
+        if not supported:
+            raise RuntimeError(
+                "packed choice scoring requires the FLEX_ATTENTION backend "
+                "(set VLLM_ATTENTION_BACKEND=FLEX_ATTENTION or unset "
+                "VLLM_ENABLE_PACKED_CHOICE_SCORING)"
+            )
 
     def _set_mm_prefix_range_for_metadata(
         self,

@@ -141,6 +141,7 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_ENABLE_NATIVE_CHOICE_SCORING: bool = False
+    VLLM_ENABLE_PACKED_CHOICE_SCORING: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1251,6 +1252,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path; this is a pure compute optimization (parity-tested).
     "VLLM_ENABLE_NATIVE_CHOICE_SCORING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_NATIVE_CHOICE_SCORING", "0"))
+    ),
+    # If set (requires VLLM_ATTENTION_BACKEND=FLEX_ATTENTION), the engine-
+    # resident choice coordinator packs all multi-token candidates of a
+    # prompt-step into ONE child sequence scored in a single forward, using
+    # a branch attention mask (candidates attend to the shared context and
+    # themselves only). Parity-tested against the multi-sequence path.
+    "VLLM_ENABLE_PACKED_CHOICE_SCORING": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PACKED_CHOICE_SCORING", "0"))
     ),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the

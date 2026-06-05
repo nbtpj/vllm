@@ -136,6 +136,16 @@ parity-tested), and only the final structured result crosses the IPC
 boundary. This removes per-candidate output serialization, client-side
 logprob pythonization, and per-step submission round trips.
 
+**Packed-pool scoring** (`VLLM_ENABLE_PACKED_CHOICE_SCORING=1`, requires
+`VLLM_ATTENTION_BACKEND=FLEX_ATTENTION` and the V1 model runner): the
+coordinator packs all multi-token candidates of a prompt-step into ONE child
+sequence scored in a single forward, using a branch attention mask
+(candidates attend to the shared context and themselves only, with logical
+rotary positions). Pool-size fewer scheduler requests per step; chunks of up
+to 16 candidates; the packed suffix never enters the prefix cache. Huge
+single-token pools (e.g. 30k variable candidates) shard automatically into
+128-id `logprob_token_ids` children regardless of this flag.
+
 The flag enables two further request-level optimizations for `batch_score`:
 
 - **Single-token fast path** -- when *all* of a prompt's choices are single

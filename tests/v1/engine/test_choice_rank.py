@@ -91,6 +91,25 @@ def child_output(child: Request, finished=True) -> EngineCoreOutput:
     sp = child.sampling_params
     assert sp is not None
     extra = sp.extra_args or {}
+    if "packed_choice_layout" in extra:
+        # Packed child: window rows over the suffix; slot r predicts the
+        # packed token at position ctx+r (the runner's anchor fix-up makes
+        # boundary slots carry each candidate's first-token logprob, which
+        # for this fake model equals TABLE[token] uniformly).
+        ctx_len = extra["packed_choice_layout"]["context_len"]
+        suffix = child.prompt_token_ids[ctx_len:]
+        logprobs = torch.tensor([[TABLE[t]] for t in suffix], dtype=torch.float32)
+        tensors = LogprobsTensors(
+            logprob_token_ids=torch.tensor([[t] for t in suffix]),
+            logprobs=logprobs,
+            selected_token_ranks=torch.tensor([2] * len(suffix)),
+        )
+        return EngineCoreOutput(
+            request_id=child.request_id,
+            new_token_ids=[0],
+            new_prompt_logprobs_tensors=tensors,
+            finish_reason=FinishReason.LENGTH if finished else None,
+        )
     if "shrinking_allowed_token_ids" in extra:
         # Decode-fused run: greedy without replacement over the allowed set.
         remaining = list(extra["shrinking_allowed_token_ids"])
@@ -493,3 +512,69 @@ def test_async_scheduling_disables_decode_run():
     orders = [s["choice_index"] for s in outs[0].choice_rank_result["selected"]]
     ref_orders, _ = reference_orders([1], [[10], [11], [12]], 3)
     assert orders == ref_orders
+
+
+# --------------------------------------------------------------------------- #
+# packed children + sharding
+# --------------------------------------------------------------------------- #
+def test_packed_children_match_reference(monkeypatch):
+    monkeypatch.setenv("VLLM_ENABLE_PACKED_CHOICE_SCORING", "1")
+    core = FakeCore()
+    core.vllm_config.model_config = __import__("types").SimpleNamespace(
+        max_model_len=1024
+    )
+    core.vllm_config.cache_config = __import__("types").SimpleNamespace(block_size=16)
+    coord = ChoiceRankCoordinator(core)
+    candidates = [[10, 11], [20, 21], [12, 22, 11]]
+    coord.try_intercept(make_parent([1, 2], candidates, k=3))
+    # One packed child instead of 3 teacher-forced children.
+    assert len(core.scheduler.queue) == 1
+    child = core.scheduler.queue[0]
+    layout = child.sampling_params.extra_args["packed_choice_layout"]
+    assert layout["context_len"] == 2
+    assert layout["spans"] == [[2, 4], [4, 6], [6, 9]]
+    assert child.prompt_token_ids == [1, 2, 10, 11, 20, 21, 12, 22, 11]
+    assert child.sampling_params.prompt_logprobs_from == 2
+
+    outs = drive(core, coord)
+    result = outs[0].choice_rank_result
+    orders = [st["choice_index"] for st in result["selected"]]
+    ref_orders, _ = reference_orders([1, 2], candidates, 3)
+    assert orders == ref_orders
+    for st in result["selected"]:
+        cand = candidates[st["choice_index"]]
+        assert st["token_logprobs"] == [TABLE[t] for t in cand]
+
+
+def test_packed_chunking_by_max_pack(monkeypatch):
+    monkeypatch.setenv("VLLM_ENABLE_PACKED_CHOICE_SCORING", "1")
+    core = FakeCore()
+    core.vllm_config.model_config = __import__("types").SimpleNamespace(
+        max_model_len=4096
+    )
+    core.vllm_config.cache_config = __import__("types").SimpleNamespace(block_size=16)
+    coord = ChoiceRankCoordinator(core)
+    # 35 multi-token candidates -> ceil(35/16) = 3 packed children.
+    candidates = [[10, 11] for _ in range(35)]
+    coord.try_intercept(make_score_parent([1], candidates))
+    assert len(core.scheduler.queue) == 3
+    outs = drive(core, coord)
+    assert len(outs[0].choice_rank_result["choices"]) == 35
+
+
+def test_fast_step_sharding_large_single_token_pool():
+    core = FakeCore()
+    coord = ChoiceRankCoordinator(core)
+    # 1000 distinct single-token candidates -> ceil(1000/128) = 8 shards.
+    ids = list(range(1000, 2000))
+    for t in ids:
+        TABLE[t] = -float(t % 97) / 10 - 0.01
+    candidates = [[t] for t in ids]
+    coord.try_intercept(make_score_parent([1], candidates))
+    assert len(core.scheduler.queue) == 8
+    outs = drive(core, coord)
+    result = outs[0].choice_rank_result
+    assert len(result["choices"]) == 1000
+    by_index = {c["index"]: c for c in result["choices"]}
+    for i, t in enumerate(ids):
+        assert by_index[i]["token_logprobs"] == [TABLE[t]]

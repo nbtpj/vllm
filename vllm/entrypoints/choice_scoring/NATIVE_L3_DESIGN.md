@@ -33,11 +33,17 @@ Four pieces, all GPU-validated against the multi-sequence path as oracle:
 
 1. **Branch attention mask** (FlexAttention only; other backends keep the
    multi-sequence path). The in-tree backend already composes
-   ``mask_mod``s; add a per-request branch layout (candidate ``[start,
-   end)`` spans in sequence coordinates) so ``kv_idx`` from another
-   candidate's span is masked. Layout must reach the metadata builder --
-   runner-side side-table keyed by request, populated from
-   ``SamplingParams`` (the packed child is engine-fabricated).
+   ``mask_mod``s and converts paged to logical (packed) coordinates; add a
+   branch restriction ``~(kv in a foreign candidate span)`` AND-composed
+   with the paged-causal base (template: ``mm_prefix_range`` /
+   ``get_prefix_lm_mask_mod``). CRITICAL: span boundaries must live in
+   persistent ``[max_num_reqs, MAX_PACK]`` tensors referenced by ONE
+   stable closure -- a per-layout Python closure (the mm_prefix pattern)
+   would trigger torch.compile recompilation on every rank step. Layout
+   reaches the runner via ``SamplingParams.extra_args
+   ["packed_choice_layout"]`` (engine-fabricated children only) and is
+   stamped onto the metadata after build, mirroring
+   ``_set_mm_prefix_range_for_metadata``.
 2. **Positions override**: packed candidate tokens need logical positions
    ``ctx_len + offset_within_candidate`` (reset per candidate), not the
    linear sequence positions the runner builds from
@@ -52,9 +58,14 @@ Four pieces, all GPU-validated against the multi-sequence path as oracle:
    spec -- the design's original §1 ``ChoiceScoringParams``.
 4. **Cache cap**: the packed child caps prefix-cache reads below
    ``ctx_len`` (reuse the ``prompt_logprobs_from`` capping path) and must
-   NOT write its packed suffix to the prefix cache (candidate KV under a
-   branch mask is not valid causal KV for other requests) -- mark the
-   suffix blocks uncacheable.
+   NOT write its packed suffix to the prefix cache: truncate the child's
+   ``Request.block_hashes`` at ``ctx_len // block_size`` and null its
+   block hasher. (Without this, the NEXT rank step's children -- whose
+   token prefix can literally equal ``ctx + chosen + cand_j`` -- could hit
+   packed blocks whose candidate KV has reset positions: silent
+   poisoning.) Positions: only the rotary input is overridden to logical
+   positions (``ctx_len + offset_within_candidate``); slot mapping,
+   seq_lens, and the mask coordinates all stay packed.
 
 Constraint: chunked prefill may split the packed sequence at any boundary;
 the flex ``mask_mod`` works on absolute coordinates so the layout-based

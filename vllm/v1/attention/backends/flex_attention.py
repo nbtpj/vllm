@@ -403,6 +403,10 @@ class FlexAttentionMetadata:
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
+    # Engine-resident packed choice scoring (branch attention):
+    # req_idx -> (context_len, [(start, end), ...]) in logical coordinates.
+    # Stamped by the model runner after build (mirrors mm_prefix_range).
+    choice_branch_spans: dict[int, tuple[int, list[tuple[int, int]]]] | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -566,6 +570,58 @@ class FlexAttentionMetadata:
 
         return final_mask_mod
 
+    # Fixed width of the branch-span tensors: keeps the closure's tensor
+    # shapes stable across steps so torch.compile never recompiles the mask.
+    CHOICE_BRANCH_MAX_SPANS = 16
+
+    def get_choice_branch_mask_mod(self) -> _mask_mod_signature:
+        """Branch restriction for packed choice scoring.
+
+        Candidates of a packed sequence occupy [start, end) spans after the
+        shared context; a query may not attend to kv inside a *foreign*
+        span. AND-composed with the paged causal base mask. Span data lives
+        in fixed-shape tensors referenced by one stable closure (per-layout
+        Python constants would recompile the mask every scoring step).
+        """
+        assert self.doc_ids is not None
+        assert self.choice_branch_spans
+        num_reqs = self.num_reqs
+        width = self.CHOICE_BRANCH_MAX_SPANS
+        device = self.block_table.device
+        # Padding: an empty span [0, 0) matches no kv index.
+        starts_cpu = torch.zeros((num_reqs, width), dtype=torch.int64)
+        ends_cpu = torch.zeros((num_reqs, width), dtype=torch.int64)
+        for req_idx, (_ctx_len, spans) in self.choice_branch_spans.items():
+            for j, (start, end) in enumerate(spans[:width]):
+                starts_cpu[req_idx, j] = start
+                ends_cpu[req_idx, j] = end
+        starts = starts_cpu.to(device, non_blocking=True)
+        ends = ends_cpu.to(device, non_blocking=True)
+        request_lookup = self.doc_ids
+
+        def final_mask_mod(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            physical_kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            (is_valid, logical_q_idx, logical_kv_idx) = (
+                self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
+            )
+            req = request_lookup[q_idx]
+            req_starts = starts[req]
+            req_ends = ends[req]
+            kv_in_span = (logical_kv_idx.unsqueeze(-1) >= req_starts) & (
+                logical_kv_idx.unsqueeze(-1) < req_ends
+            )
+            q_in_span = (logical_q_idx.unsqueeze(-1) >= req_starts) & (
+                logical_q_idx.unsqueeze(-1) < req_ends
+            )
+            foreign = kv_in_span & ~q_in_span
+            return torch.where(is_valid, ~foreign.any(dim=-1), False)
+
+        return final_mask_mod
+
     def get_mask_mod(self):
         # Stage-1: initialize the base mask_mod
         # (causal mask for decoder or bidirectional mask for encoder)
@@ -583,6 +639,9 @@ class FlexAttentionMetadata:
             # Add prefix LM mask for vision-language prefix LM attention
             prefix_lm_mask_mod = self.get_prefix_lm_mask_mod()
             mask_mod = or_masks(mask_mod, prefix_lm_mask_mod)
+        if self.choice_branch_spans:
+            # Restrict packed choice-scoring candidates to context + self.
+            mask_mod = and_masks(mask_mod, self.get_choice_branch_mask_mod())
         return mask_mod
 
     def get_transformed_score_mod(self) -> _score_mod_signature | None:
@@ -981,6 +1040,7 @@ class FlexAttentionImpl(AttentionImpl):
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     logical_mask_mod: _mask_mod_signature | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
+    choice_branch_spans: dict[int, tuple[int, list[tuple[int, int]]]] | None = None
 
     def __init__(
         self,
@@ -1124,6 +1184,13 @@ class FlexAttentionImpl(AttentionImpl):
 
         if self.mm_prefix_range != getattr(attn_metadata, "mm_prefix_range", None):
             self.mm_prefix_range = attn_metadata.mm_prefix_range
+            attn_metadata.mask_mod = attn_metadata.get_mask_mod()
+            needs_rebuild_block_mask = True
+
+        if self.choice_branch_spans != getattr(
+            attn_metadata, "choice_branch_spans", None
+        ):
+            self.choice_branch_spans = attn_metadata.choice_branch_spans
             attn_metadata.mask_mod = attn_metadata.get_mask_mod()
             needs_rebuild_block_mask = True
 

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.v1.engine import (
@@ -62,16 +63,15 @@ SCORE_EXTRA_ARGS_KEY = "choice_score"
 _CHILD_SEP = "\x00cr"
 
 # Abuse guards for payloads arriving via public endpoints.
-MAX_CANDIDATES = 1024
+MAX_CANDIDATES = 32768
 MAX_CANDIDATE_TOKENS = 4096
-
-# Sentinel candidate index marking a fast (single-child) step: one request
-# scores every remaining single-token candidate via logprob_token_ids.
-FAST_STEP = -1
 
 # Sentinel marking a decode-fused run: ONE decode request performs every
 # remaining selection step (greedy decoding over a shrinking allowed set).
 DECODE_RUN = -2
+
+# Maximum candidates per packed child (bounds the branch-mask span tensors).
+MAX_PACK = 16
 
 # Sentinel vocab rank for "not the argmax" on the fast step (exact rank is
 # unknown; ranks only feed is_greedy-style checks downstream).
@@ -268,7 +268,7 @@ class ChoiceRankCoordinator:
         ):
             self._spawn_decode_run(group, ids, steps_left)
             return
-        if all_single and len(set(ids)) <= MAX_LOGPROB_TOKEN_IDS:
+        if all_single:
             self._spawn_fast_step(group, ids)
             return
         self._spawn_scoring_children(group, group.remaining)
@@ -276,11 +276,7 @@ class ChoiceRankCoordinator:
     def _spawn_score(self, group: _RankGroup) -> None:
         """Spawn the (single) scoring wave plan for a score group."""
         ids = [c[0] for _, c in group.remaining]
-        if (
-            all(len(c) == 1 for _, c in group.remaining)
-            and all(t != 0 for t in ids)
-            and len(set(ids)) <= MAX_LOGPROB_TOKEN_IDS
-        ):
+        if all(len(c) == 1 for _, c in group.remaining) and all(t != 0 for t in ids):
             self._spawn_fast_step(group, ids)
             return
         if group.phase == 0 and len(group.remaining) >= 2 and len(group.context) >= 32:
@@ -293,6 +289,107 @@ class ChoiceRankCoordinator:
         self._spawn_scoring_children(group, unscored)
 
     def _spawn_scoring_children(
+        self, group: _RankGroup, items: list[tuple[int, list[int]]]
+    ) -> None:
+        if envs.VLLM_ENABLE_PACKED_CHOICE_SCORING and len(items) >= 2:
+            self._spawn_packed_children(group, items)
+            return
+        self._spawn_plain_children(group, items)
+
+    def _spawn_packed_children(
+        self, group: _RankGroup, items: list[tuple[int, list[int]]]
+    ) -> None:
+        """Pack candidates into single-forward children (branch-masked).
+
+        Chunked by MAX_PACK candidates and by max_model_len; chunks that end
+        up singleton fall back to plain teacher-forced children. Requires
+        the FlexAttention backend (the runner rejects packed layouts on
+        backends without branch-mask support).
+        """
+        max_len = self.core.vllm_config.model_config.max_model_len
+        context_len = len(group.context)
+        budget = max_len - context_len - 1
+
+        chunk: list[tuple[int, list[int]]] = []
+        chunk_tokens = 0
+        chunks: list[list[tuple[int, list[int]]]] = []
+        for item in items:
+            cand_len = len(item[1])
+            if chunk and (len(chunk) >= MAX_PACK or chunk_tokens + cand_len > budget):
+                chunks.append(chunk)
+                chunk, chunk_tokens = [], 0
+            chunk.append(item)
+            chunk_tokens += cand_len
+        if chunk:
+            chunks.append(chunk)
+
+        for chunk_no, chunk in enumerate(chunks):
+            total = sum(len(c) for _, c in chunk)
+            if len(chunk) < 2 or total > budget:
+                self._spawn_plain_children(group, chunk)
+                continue
+            self._spawn_one_packed_child(group, chunk, chunk_no)
+
+    def _spawn_one_packed_child(
+        self,
+        group: _RankGroup,
+        chunk: list[tuple[int, list[int]]],
+        chunk_no: int,
+    ) -> None:
+        context_len = len(group.context)
+        packed: list[int] = list(group.context)
+        spans: list[list[int]] = []
+        slices: list[tuple[int, int, int]] = []
+        for orig_idx, cand in chunk:
+            start = len(packed)
+            packed.extend(cand)
+            end = len(packed)
+            spans.append([start, end])
+            # Window slot rows for this candidate: the boundary slot
+            # (start - ctx_len) holds its first token's logprob after the
+            # runner's anchor fix-up; in-candidate rows follow contiguously.
+            slices.append((orig_idx, start - context_len, end - context_len))
+
+        child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.pack{chunk_no}"
+        params = SamplingParams(
+            max_tokens=1,
+            temperature=0.0,
+            prompt_logprobs=0,
+            prompt_logprobs_from=context_len,
+            detokenize=False,
+            extra_args={
+                "packed_choice_layout": {
+                    "context_len": context_len,
+                    "spans": spans,
+                }
+            },
+        )
+        child_ecr = EngineCoreRequest(
+            request_id=child_id,
+            prompt_token_ids=packed,
+            mm_features=None,
+            sampling_params=params,
+            pooling_params=None,
+            arrival_time=group.arrival_time,
+            lora_request=group.lora_request,
+            cache_salt=None,
+            data_parallel_rank=None,
+            client_index=group.client_index,
+            priority=group.priority,
+        )
+        child = Request.from_engine_core_request(
+            child_ecr, self.core.request_block_hasher
+        )
+        # The packed suffix must never enter the prefix cache: candidate KV
+        # under a branch mask (reset positions) is not valid causal KV.
+        block_size = self.core.vllm_config.cache_config.block_size
+        del child.block_hashes[context_len // block_size :]
+        child._block_hasher = None
+        self.child_to_parent[child_id] = group.parent_id
+        group.pending[child_id] = ("packed", slices)
+        self.core.scheduler.add_request(child)
+
+    def _spawn_plain_children(
         self, group: _RankGroup, items: list[tuple[int, list[int]]]
     ) -> None:
         context_len = len(group.context)
@@ -351,31 +448,38 @@ class ChoiceRankCoordinator:
         self.core.scheduler.add_request(child)
 
     def _spawn_fast_step(self, group: _RankGroup, ids: list[int]) -> None:
-        child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.fast"
-        child_ecr = EngineCoreRequest(
-            request_id=child_id,
-            prompt_token_ids=list(group.context),
-            mm_features=None,
-            sampling_params=SamplingParams(
-                max_tokens=1,
-                temperature=0.0,
-                logprob_token_ids=sorted(set(ids)),
-                detokenize=False,
-            ),
-            pooling_params=None,
-            arrival_time=group.arrival_time,
-            lora_request=group.lora_request,
-            cache_salt=None,
-            data_parallel_rank=None,
-            client_index=group.client_index,
-            priority=group.priority,
-        )
-        child = Request.from_engine_core_request(
-            child_ecr, self.core.request_block_hasher
-        )
-        self.child_to_parent[child_id] = group.parent_id
-        group.pending[child_id] = FAST_STEP
-        self.core.scheduler.add_request(child)
+        """One bare-context child per <=128-id shard scores single-token
+        candidates via logprob_token_ids (huge pools shard into multiple
+        children, all sharing the cached context)."""
+        items = [(orig_idx, cand[0]) for orig_idx, cand in group.remaining]
+        for shard_no in range(0, len(items), MAX_LOGPROB_TOKEN_IDS):
+            shard = items[shard_no : shard_no + MAX_LOGPROB_TOKEN_IDS]
+            shard_ids = sorted({t for _, t in shard})
+            child_id = f"{group.parent_id}{_CHILD_SEP}{group.step}.fast{shard_no}"
+            child_ecr = EngineCoreRequest(
+                request_id=child_id,
+                prompt_token_ids=list(group.context),
+                mm_features=None,
+                sampling_params=SamplingParams(
+                    max_tokens=1,
+                    temperature=0.0,
+                    logprob_token_ids=shard_ids,
+                    detokenize=False,
+                ),
+                pooling_params=None,
+                arrival_time=group.arrival_time,
+                lora_request=group.lora_request,
+                cache_salt=None,
+                data_parallel_rank=None,
+                client_index=group.client_index,
+                priority=group.priority,
+            )
+            child = Request.from_engine_core_request(
+                child_ecr, self.core.request_block_hasher
+            )
+            self.child_to_parent[child_id] = group.parent_id
+            group.pending[child_id] = ("fast", shard)
+            self.core.scheduler.add_request(child)
 
     # ------------------------------------------------------------------ #
     # output interception
@@ -432,12 +536,28 @@ class ChoiceRankCoordinator:
             return
 
         pending_idx = group.pending.get(out.request_id)
-        if pending_idx == DECODE_RUN:
+        if isinstance(pending_idx, tuple) and pending_idx[0] == "packed":
+            tensors = out.new_prompt_logprobs_tensors
+            if tensors is not None:
+                # Window rows over the packed suffix; each candidate's slice
+                # is contiguous (boundary slot fixed up by the runner to its
+                # first token's anchor-row logprob).
+                for orig_idx, lo, hi in pending_idx[1]:
+                    group.results[orig_idx] = (
+                        tensors.logprobs[lo:hi, 0].tolist(),
+                        tensors.selected_token_ranks[lo:hi].tolist(),
+                    )
+            if not out.finished:
+                return
+            # Fall through to the shared completion handling below.
+        elif pending_idx == DECODE_RUN:
             self._consume_decode_output(group, out)
             return
-        if pending_idx == FAST_STEP:
-            # Fast step: one child scored every remaining single-token
-            # candidate via logprob_token_ids (sample logprobs, row 0).
+        elif isinstance(pending_idx, tuple) and pending_idx[0] == "fast":
+            # Fast shard: this child scored its shard of single-token
+            # candidates via logprob_token_ids (sample logprobs, row 0).
+            # Sampling is unmasked greedy, so the sampled token is the
+            # global argmax -- exact is_greedy for every shard.
             lists = out.new_logprobs
             if lists is not None and len(lists.logprob_token_ids):
                 lp_map = {
@@ -445,16 +565,12 @@ class ChoiceRankCoordinator:
                     for t, lp in zip(lists.logprob_token_ids[0], lists.logprobs[0])
                 }
                 sampled = out.new_token_ids[0] if out.new_token_ids else None
-                ok = True
-                for orig_idx, cand in group.remaining:
-                    logprob = lp_map.get(cand[0])
+                for orig_idx, token in pending_idx[1]:
+                    logprob = lp_map.get(token)
                     if logprob is None:
-                        ok = False
-                        break
-                    rank = 1 if cand[0] == sampled else NOT_GREEDY_RANK
+                        continue  # completeness check fails the group
+                    rank = 1 if token == sampled else NOT_GREEDY_RANK
                     group.results[orig_idx] = ([logprob], [rank])
-                if not ok:
-                    group.results.clear()
         else:
             tensors = out.new_prompt_logprobs_tensors
             if tensors is not None and pending_idx is not None:
@@ -471,11 +587,12 @@ class ChoiceRankCoordinator:
         self.child_to_parent.pop(out.request_id, None)
         if orig_idx is None:
             return
-        scored = (
-            len(group.results) == len(group.remaining)
-            if orig_idx == FAST_STEP
-            else orig_idx in group.results
-        )
+        if isinstance(orig_idx, tuple) and orig_idx[0] == "packed":
+            scored = all(i in group.results for i, _, _ in orig_idx[1])
+        elif isinstance(orig_idx, tuple) and orig_idx[0] == "fast":
+            scored = all(i in group.results for i, _ in orig_idx[1])
+        else:
+            scored = orig_idx in group.results
         if not scored:
             # Child finished without producing logprobs (e.g. aborted by
             # the engine). Fail the whole group rather than mis-rank.
